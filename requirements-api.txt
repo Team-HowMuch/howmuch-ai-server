@@ -1,0 +1,9 @@
+# API 컨테이너용 (VLM은 vLLM 컨테이너가 담당하므로 torch/mlx 불필요)
+fastapi
+uvicorn[standard]
+python-multipart
+pillow
+httpx
+kiwipiepy
+rapidocr
+onnxruntime

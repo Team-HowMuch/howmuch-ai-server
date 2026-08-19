@@ -1,0 +1,8 @@
+.venv/
+__pycache__/
+*.pyc
+server.log
+*.zip
+
+# 개인 결제 정보가 담긴 실제 영수증 사진
+samples/

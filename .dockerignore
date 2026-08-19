@@ -1,0 +1,7 @@
+.venv
+server.log
+samples
+*.zip
+docs
+__pycache__
+test_*.py

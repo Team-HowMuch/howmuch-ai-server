@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<title>영수증 OCR 테스트</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", sans-serif;
+    background: #0f1115; color: #e8eaed; min-height: 100vh;
+    display: flex; flex-direction: column; align-items: center; padding: 24px 16px 48px;
+  }
+  h1 { font-size: 20px; margin-bottom: 4px; }
+  .sub { color: #9aa0a6; font-size: 13px; margin-bottom: 24px; }
+  .card {
+    width: 100%; max-width: 480px; background: #1a1d24; border: 1px solid #2a2e37;
+    border-radius: 16px; padding: 20px; margin-bottom: 16px;
+  }
+  .shoot {
+    display: flex; align-items: center; justify-content: center; gap: 8px;
+    width: 100%; padding: 16px; border: none; border-radius: 12px;
+    background: #4c8bf5; color: #fff; font-size: 17px; font-weight: 600; cursor: pointer;
+  }
+  .shoot:active { opacity: .8; }
+  #preview { width: 100%; border-radius: 12px; margin-top: 14px; display: none; }
+  #status { margin-top: 14px; font-size: 14px; color: #9aa0a6; text-align: center; display: none; }
+  .spinner {
+    display: inline-block; width: 14px; height: 14px; border: 2px solid #4c8bf5;
+    border-top-color: transparent; border-radius: 50%; animation: spin .8s linear infinite;
+    vertical-align: -2px; margin-right: 6px;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  #resultCard { display: none; }
+  .field { display: flex; justify-content: space-between; padding: 10px 0; border-bottom: 1px solid #2a2e37; font-size: 15px; }
+  .field:last-child { border-bottom: none; }
+  .field .k { color: #9aa0a6; }
+  .field .v { font-weight: 600; text-align: right; max-width: 60%; word-break: break-all; }
+  .total .v { color: #7bd88f; font-size: 18px; }
+  h2 { font-size: 14px; color: #9aa0a6; margin: 18px 0 8px; }
+  .item { display: flex; justify-content: space-between; padding: 8px 0; font-size: 14px; border-bottom: 1px dashed #2a2e37; }
+  .item:last-child { border-bottom: none; }
+  details { margin-top: 16px; }
+  summary { font-size: 13px; color: #9aa0a6; cursor: pointer; }
+  pre { font-size: 12px; background: #0f1115; padding: 12px; border-radius: 8px; overflow-x: auto; margin-top: 8px; white-space: pre-wrap; word-break: break-all; }
+  .elapsed { font-size: 12px; color: #9aa0a6; text-align: right; margin-top: 10px; }
+  .err { color: #f28b82; font-size: 14px; margin-top: 12px; }
+  .badge { display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 10px; margin-left: 6px; vertical-align: 1px; }
+  .badge.ok { background: #1e3a2a; color: #7bd88f; }
+  .badge.warn { background: #3a2e1e; color: #fdd663; }
+  .badge.fix { background: #1e2c3a; color: #8ab4f8; }
+  .corr { font-size: 13px; padding: 10px 12px; background: #1e2c3a; border-radius: 8px; margin-top: 12px; }
+  .corr .line { padding: 3px 0; }
+  .corr del { color: #f28b82; }
+  .corr b { color: #8ab4f8; }
+</style>
+</head>
+<body>
+<h1>영수증 OCR 테스트</h1>
+<div class="sub">Qwen2.5-VL 3B · 로컬 맥북 추론</div>
+
+<div class="card">
+  <button class="shoot" onclick="document.getElementById('file').click()">&#128247; 영수증 찍기</button>
+  <input type="file" id="file" accept="image/*" capture="environment" hidden>
+  <img id="preview" alt="">
+  <div id="status"></div>
+</div>
+
+<div class="card" id="resultCard">
+  <div class="field"><span class="k">상호명</span><span class="v" id="store"></span></div>
+  <div class="field"><span class="k">일시</span><span class="v" id="date"></span></div>
+  <div class="field"><span class="k">결제수단</span><span class="v" id="pay"></span></div>
+  <div class="field total"><span class="k">합계</span><span class="v" id="total"></span></div>
+  <h2>품목</h2>
+  <div id="items"></div>
+  <div class="corr" id="corr" style="display:none"></div>
+  <details><summary>원본 응답 보기 (VLM)</summary><pre id="raw"></pre></details>
+  <details><summary>OCR 인식 텍스트 보기</summary><pre id="ocrLines"></pre></details>
+  <div class="elapsed" id="elapsed"></div>
+</div>
+
+<script>
+const fileInput = document.getElementById('file');
+const status = document.getElementById('status');
+const preview = document.getElementById('preview');
+const resultCard = document.getElementById('resultCard');
+
+const won = n => (n == null ? '-' : Number(n).toLocaleString('ko-KR') + '원');
+
+fileInput.addEventListener('change', async () => {
+  const file = fileInput.files[0];
+  if (!file) return;
+
+  preview.src = URL.createObjectURL(file);
+  preview.style.display = 'block';
+  resultCard.style.display = 'none';
+  status.style.display = 'block';
+  status.innerHTML = '<span class="spinner"></span>분석 중... (약 30초)';
+
+  const form = new FormData();
+  form.append('file', file);
+
+  try {
+    const res = await fetch('/ocr/receipt', { method: 'POST', body: form });
+    const data = await res.json();
+    status.style.display = 'none';
+
+    if (!data.ok || !data.result) {
+      status.style.display = 'block';
+      status.innerHTML = '<span class="err">분석 실패: ' + (data.error || 'JSON 파싱 실패') + '</span>';
+      if (data.raw) { showRaw(data); }
+      return;
+    }
+    const r = data.result;
+    document.getElementById('store').textContent = r.store_name ?? '-';
+    document.getElementById('date').textContent = r.purchased_at ?? '-';
+    document.getElementById('pay').textContent = r.payment_method ?? '-';
+    document.getElementById('total').innerHTML = won(r.total_amount) +
+      (r.total_verified
+        ? '<span class="badge ok">OCR 일치</span>'
+        : '<span class="badge warn">미검증</span>');
+
+    const correctedNames = new Set((data.corrections || []).map(c => c.after));
+    const itemsEl = document.getElementById('items');
+    itemsEl.innerHTML = '';
+    (r.items || []).forEach(it => {
+      const div = document.createElement('div');
+      div.className = 'item';
+      const fixBadge = correctedNames.has(it.name) ? '<span class="badge fix">보정됨</span>' : '';
+      div.innerHTML = '<span>' + (it.name ?? '-') + (it.quantity > 1 ? ' × ' + it.quantity : '') +
+                      fixBadge + '</span><span>' + won(it.price) + '</span>';
+      itemsEl.appendChild(div);
+    });
+    if (!(r.items || []).length) itemsEl.innerHTML = '<div class="item"><span>품목 없음</span></div>';
+
+    const corrEl = document.getElementById('corr');
+    if ((data.corrections || []).length) {
+      corrEl.style.display = 'block';
+      corrEl.innerHTML = '<div style="margin-bottom:4px">단어 보정 내역</div>' +
+        data.corrections.map(c =>
+          '<div class="line"><del>' + c.before + '</del> → <b>' + c.after + '</b> (' + c.reason + ')</div>'
+        ).join('');
+    } else {
+      corrEl.style.display = 'none';
+    }
+
+    document.getElementById('raw').textContent = data.raw;
+    document.getElementById('ocrLines').textContent =
+      (data.ocr_lines || []).map(l => l.confidence.toFixed(2) + ' | ' + l.text).join('\n');
+    document.getElementById('elapsed').textContent = '추론 시간: ' + data.elapsed_sec + '초';
+    resultCard.style.display = 'block';
+  } catch (e) {
+    status.innerHTML = '<span class="err">요청 실패: ' + e.message + '</span>';
+  }
+  fileInput.value = '';
+});
+
+function showRaw(data) {
+  document.getElementById('raw').textContent = data.raw;
+  resultCard.style.display = 'block';
+}
+</script>
+</body>
+</html>
