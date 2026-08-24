@@ -20,7 +20,17 @@ sudo nvidia-ctk runtime configure --runtime=docker
 sudo systemctl restart docker
 ```
 
-## 1. 코드 전송 (맥북에서 실행)
+## 1. 코드 배포
+
+### Git (권장)
+
+```bash
+cd ~/howmuch-ai-server
+git pull
+docker compose up -d --build
+```
+
+### rsync (초기 1회 또는 Git 미사용 시)
 
 ```bash
 rsync -av --exclude .venv --exclude server.log --exclude '*.zip' \
@@ -49,7 +59,43 @@ docker compose ps
 curl -F "file=@receipt.jpg" http://localhost:8600/ocr/receipt
 ```
 
-폰/외부에서: `http://<홈서버IP>:8600` (촬영 테스트 페이지)
+폰/외부(Tailscale VPN): `http://100.x.x.x:8600` (촬영 테스트 페이지)
+
+## 4. Tailscale Funnel (팀원 공개 HTTPS)
+
+Tailscale 앱 없이 Swagger/API를 공개할 때 사용한다. **재부팅 후에는 Funnel만 따로 켜야 할 수 있다.**
+
+```bash
+sudo tailscale funnel --bg 8600
+tailscale funnel status
+```
+
+- Swagger: `https://<호스트명>.<테일넷>.ts.net/docs`
+- 최초 1회 Tailscale Admin Console에서 Funnel/HTTPS 활성화 필요할 수 있음
+
+**증상:** Tailscale 관리자에서 기기가 Online인데 공개 URL만 안 됨  
+→ API는 살아 있을 수 있음. `curl http://localhost:8600/docs` 확인 후 `tailscale funnel --bg 8600` 재실행.
+
+## 5. 재부팅 후 자동 기동 (systemd)
+
+```bash
+cd ~/howmuch-ai-server
+chmod +x scripts/install-systemd.sh
+sudo scripts/install-systemd.sh
+```
+
+설치 내용:
+- `howmuch-ai-server.service` — `docker compose up -d`
+- `tailscale-funnel.service` — Funnel 8600
+- 절전 타겟 mask + logind 유휴 절전 ignore
+
+데스크톱 Ubuntu면 GNOME 전원도 확인:
+
+```bash
+gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-ac-type 'nothing'
+```
+
+BIOS: ErP/Deep Sleep Off, Restore on AC Power Loss → Power On
 
 ## 운영 명령어
 

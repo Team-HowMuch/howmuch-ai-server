@@ -68,3 +68,6 @@ python3 -m venv .venv
 | `vlm.py` | VLM 백엔드 추상화 (MLX 로컬 / vLLM OpenAI 호환) |
 | `corrector.py` | 한국어 단어 검증(Kiwi) 및 혼동 자모 보정 |
 | `docker-compose.yml` | vLLM + API 운영 구성 |
+| `DEPLOY.md` | GPU 서버 배포, Funnel, systemd 자동 기동 |
+| `docs/dual-model-ocr.md` | 이중 모델 파이프라인 설계 |
+| `docs/portfolio-*.svg` | 포트폴리오용 다이어그램 (PNG 동봉) |
