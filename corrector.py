@@ -1,10 +1,10 @@
 """VLM/OCR 결과 병합 및 한국어 단어 보정 모듈.
 
-전략:
-1. VLM 품목명이 OCR 텍스트와 (거의) 일치하면 그대로 채택 (두 모델 합의)
-2. 불일치하면 Kiwi 형태소 분석 점수로 "실존 단어" 쪽을 선택
-3. 둘 다 미등록 단어면 시각적 혼동 자모(ㅊ↔ㅈ 등)를 치환한 후보 중
-   점수가 가장 좋은 실존 단어로 보정
+기본은 모델이 읽은 품목명을 유지한다. Kiwi 점수는 상품명보다 고빈도
+일반명사를 선호해서, 점수만으로 갈아끼우면 구운란→구운난처럼 망가진다.
+
+보정은 원본이 미등록(OOV) 덩어리일 때만 한다.
+예: 잠치김밥(OOV) → 참치김밥(실존). 구운란·신라면소컵은 분석 가능하므로 그대로 둔다.
 """
 import re
 from dataclasses import dataclass, field
@@ -31,8 +31,22 @@ _CODAS = ["", "ㄱ", "ㄲ", "ㄳ", "ㄴ", "ㄵ", "ㄶ", "ㄷ", "ㄹ", "ㄺ", "�
           "ㄾ", "ㄿ", "ㅀ", "ㅁ", "ㅂ", "ㅄ", "ㅅ", "ㅆ", "ㅇ", "ㅈ", "ㅊ", "ㅋ",
           "ㅌ", "ㅍ", "ㅎ"]
 
-# 보정 채택에 필요한 최소 점수 개선 폭 (참치김밥 vs 잠치김밥은 약 10점 차이)
-_SCORE_MARGIN = 3.0
+# 실제 OCR 오독(잠치김밥→참치김밥, 고추정→고추장)은 약 10점.
+# 상품 표기 vs 고빈도 일반명사(구운란→구운난)는 약 3~4점이라 그 아래로 둔다.
+_SCORE_MARGIN = 8.0
+
+# 편의점 영수증에 자주 나오지만 일반 사전에는 약하게 잡히는 상품 형태
+_USER_WORDS = [
+    ("소컵", "NNG"),
+    ("큰컵", "NNG"),
+    ("대컵", "NNG"),
+    ("미니컵", "NNG"),
+    ("컵라면", "NNG"),
+    ("구운란", "NNG"),
+    ("훈제란", "NNG"),
+    ("반숙란", "NNG"),
+    ("염계란", "NNG"),
+]
 
 
 def _decompose(ch: str):
@@ -72,6 +86,10 @@ def _jamo_distance(a: str, b: str) -> int:
     return dp[-1]
 
 
+def _similar_length(a: str, b: str) -> bool:
+    return abs(len(a) - len(b)) <= max(1, len(a) // 4)
+
+
 @dataclass
 class Correction:
     original: str
@@ -84,6 +102,32 @@ class Correction:
 class KoreanCorrector:
     def __init__(self):
         self._kiwi = Kiwi()
+        for word, tag in _USER_WORDS:
+            self._kiwi.add_user_word(word, tag)
+
+    def _tokens(self, text: str):
+        return self._kiwi.tokenize(text)
+
+    def _has_oov(self, text: str) -> bool:
+        return any(token.oov for token in self._tokens(text))
+
+    def _one_char_nouns(self, text: str) -> set[str]:
+        return {
+            token.form
+            for token in self._tokens(text)
+            if token.len == 1 and token.tag.startswith("N")
+        }
+
+    def _is_safe_fix(self, original: str, candidate: str) -> bool:
+        """OOV 오독만 실존 단어로 되돌린다. 빈도 높은 일반명사로 바꾸는 건 거부."""
+        if original == candidate or len(original) != len(candidate):
+            return False
+        if not self._has_oov(original) or self._has_oov(candidate):
+            return False
+        extra_glue = self._one_char_nouns(candidate) - self._one_char_nouns(original)
+        if extra_glue:
+            return False
+        return self.score(candidate) - self.score(original) >= _SCORE_MARGIN
 
     def score(self, text: str) -> float:
         """Kiwi 분석 점수. 높을수록 자연스러운(실존하는) 한국어."""
@@ -119,6 +163,8 @@ class KoreanCorrector:
         limit = max(2, len(_jamo_seq(korean)) // 3)
         for line in ocr_texts:
             for token in re.findall(r"[가-힣]{2,}", line):
+                if not _similar_length(korean, token):
+                    continue
                 dist = _jamo_distance(korean, token)
                 if dist < best_dist:
                     best, best_dist = token, dist
@@ -144,33 +190,33 @@ class KoreanCorrector:
         return Correction(word, rebuilt, changed, ",".join(reversed(reasons)), all_candidates)
 
     def _correct_run(self, korean: str, ocr_texts: list[str]) -> Correction:
-        base_score = self.score(korean)
-        candidates: dict[str, str] = {}  # 후보 -> 출처
-
-        # 1) OCR 교차 검증: 비슷한 토큰이 있으면 후보에 추가
         ocr_token = self._find_similar_ocr_token(korean, ocr_texts)
         if ocr_token == korean:
             return Correction(korean, korean, False, "vlm_ocr_agree")
+
+        # 분석 가능한 상품명(구운란, 소컵)은 Kiwi 점수가 높아도 손대지 않는다.
+        if not self._has_oov(korean):
+            return Correction(korean, korean, False, "original_plausible")
+
+        candidates: dict[str, str] = {}
         if ocr_token:
             candidates[ocr_token] = "ocr"
-
-        # 2) 혼동 자모 치환 후보
         for cand in self._confusion_candidates(korean):
             candidates.setdefault(cand, "confusion_swap")
-
         if not candidates:
             return Correction(korean, korean, False, "no_candidates")
 
-        scored = sorted(
-            ((cand, src, self.score(cand)) for cand, src in candidates.items()),
-            key=lambda x: x[2],
-            reverse=True,
-        )
-        best_cand, best_src, best_score = scored[0]
+        safe = [
+            (cand, src, self.score(cand))
+            for cand, src in candidates.items()
+            if self._is_safe_fix(korean, cand)
+        ]
+        if not safe:
+            return Correction(korean, korean, False, "original_plausible")
 
-        if best_score - base_score >= _SCORE_MARGIN:
-            return Correction(
-                korean, best_cand, True, best_src,
-                candidates=[(c, round(s, 1)) for c, _, s in scored[:5]],
-            )
-        return Correction(korean, korean, False, "original_plausible")
+        safe.sort(key=lambda item: item[2], reverse=True)
+        best_cand, best_src, _ = safe[0]
+        return Correction(
+            korean, best_cand, True, best_src,
+            candidates=[(cand, round(score, 1)) for cand, _, score in safe[:5]],
+        )
