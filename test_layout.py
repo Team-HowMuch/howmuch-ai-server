@@ -298,6 +298,63 @@ def test_merge_baemin_receipt_structure_reconciliation():
     assert {"sub_promoted", "sub_reassigned", "ocr_layout"} <= reasons
 
 
+def test_merge_demotes_marker_named_items():
+    """카페형: OCR이 ▶ 마커를 놓쳐 layout은 최상위로 보지만, VLM 이름의 마커로 강등."""
+    import server
+    from corrector import KoreanCorrector
+
+    if server._corrector is None:
+        server._corrector = KoreanCorrector()
+
+    ocr_lines = [
+        _line("수박주스(Only Ice)", 100, 100),
+        _line("4,300", 600, 150),
+        _line("백도스무디", 100, 200),
+        _line("4,200", 600, 250),
+        _line("펄추가(Only Ice)", 102, 300),  # OCR이 ▶ 글리프를 놓침 (들여쓰기도 없음)
+        _line("1,000", 600, 350),
+        _line("합계 금액", 100, 400),
+        _line("9,500", 600, 400),
+    ]
+    parsed = {
+        "items": [
+            {"name": "수박주스(Only Ice)", "quantity": 1, "price": 4300, "sub_items": []},
+            {"name": "백도스무디", "quantity": 1, "price": 4200, "sub_items": []},
+            {"name": "▶ 개인텀블러지참", "quantity": 1, "price": 0, "sub_items": []},
+            {"name": "▶ 펄추가(Only Ice)", "quantity": 1, "price": 1000, "sub_items": []},
+        ],
+        "total_amount": 9500,
+    }
+    merged, corrections = server._merge(parsed, ocr_lines)
+    names = [it["name"] for it in merged["items"]]
+    assert names == ["수박주스(Only Ice)", "백도스무디"]
+    assert [(s["name"], s["price"]) for s in merged["items"][1]["sub_items"]] == [
+        ("개인텀블러지참", 0),
+        ("펄추가(Only Ice)", 1000),
+    ]
+    assert merged["total_verified"] is True
+    assert sum(1 for c in corrections if c["reason"] == "sub_demoted") == 2
+
+
+def test_demote_skipped_when_all_items_have_markers():
+    """모든 품목에 마커가 있으면 불릿 장식으로 보고 강등하지 않는다."""
+    import server
+    from corrector import KoreanCorrector
+
+    if server._corrector is None:
+        server._corrector = KoreanCorrector()
+
+    parsed = {
+        "items": [
+            {"name": "▶아메리카노", "price": 4500, "sub_items": []},
+            {"name": "▶카페라떼", "price": 5000, "sub_items": []},
+        ],
+        "total_amount": 9500,
+    }
+    merged, _ = server._merge(parsed, [])
+    assert [it["name"] for it in merged["items"]] == ["▶아메리카노", "▶카페라떼"]
+
+
 def test_merge_total_mismatch_fails_verification():
     import server
     from corrector import KoreanCorrector

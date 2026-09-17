@@ -92,7 +92,8 @@ class CorrectionEntry(BaseModel):
             "ocr_recovered(VLM 누락 품목을 좌표 기반으로 복구) | ocr_layout(좌표 기반 합계 보완) | "
             "barcode_price_paired(품목명 줄과 바코드·금액 줄 병합) | "
             "sub_promoted(잘못 하위로 묶인 품목을 최상위로 승격) | "
-            "sub_reassigned(하위 옵션을 좌표상 실제 부모 품목으로 이동)"
+            "sub_reassigned(하위 옵션을 좌표상 실제 부모 품목으로 이동) | "
+            "sub_demoted(옵션 마커가 남은 품목을 직전 품목의 하위로 강등)"
         ),
         examples=["confusion_swap"],
     )
@@ -377,6 +378,43 @@ def _apply_layout(kept: list[dict], layout, ocr_texts: list[str], corrections: l
         )
 
 
+_ITEM_MARKER = re.compile(r"^[▶►▸>›»└+*~]\s*|^-\s+")
+
+
+def _demote_marked_items(kept: list[dict], corrections: list):
+    """이름에 옵션 마커(▶, >, + 등)가 남은 최상위 품목을 직전 품목의 하위로 내린다.
+
+    OCR이 마커 글리프를 놓치면 layout은 최상위로 판정하지만, 영수증에 인쇄된
+    마커는 명시적 계층 표기다(하삼동커피 실측: ▶개인텀블러지참). VLM이 이름에
+    남긴 마커를 계층 증거로 쓴다. 모든 품목에 마커가 있으면 불릿 장식으로 보고
+    건너뛴다. layout에서 승격된 품목은 이름 정규화로 마커가 이미 벗겨져 있어
+    다시 강등되지 않는다.
+    """
+    marked = [it for it in kept if _ITEM_MARKER.match((it.get("name") or "").strip())]
+    if not marked or len(marked) == len(kept):
+        return
+    parent = None
+    for it in list(kept):
+        name = (it.get("name") or "").strip()
+        if not _ITEM_MARKER.match(name):
+            parent = it
+            continue
+        if parent is None:
+            continue  # 첫 품목이 마커면 붙일 부모가 없다
+        stripped = _ITEM_MARKER.sub("", name)
+        parent["sub_items"].append({"name": stripped, "price": it.get("price")})
+        parent["sub_items"].extend(it.get("sub_items") or [])
+        kept.remove(it)
+        corrections.append(
+            {
+                "field": "items",
+                "before": name,
+                "after": f"{parent.get('name')} > {stripped}",
+                "reason": "sub_demoted",
+            }
+        )
+
+
 def _items_sum(items: list[dict]) -> int:
     total = 0
     for it in items:
@@ -404,10 +442,11 @@ def _merge(parsed: dict, ocr_lines: list[dict]) -> tuple[dict, list[dict]]:
         _correct_name(item, "name", "item.name", ocr_texts, corrections)
         for sub in item["sub_items"]:
             if isinstance(sub.get("name"), str):
-                sub["name"] = re.sub(r"^[-*+└>›~\s]+", "", sub["name"])  # 옵션 기호 제거
+                sub["name"] = re.sub(r"^[-*+└>›»▶►▸~\s]+", "", sub["name"])  # 옵션 기호 제거
             _correct_name(sub, "name", "item.sub_items.name", ocr_texts, corrections)
 
     _apply_layout(kept, layout, ocr_texts, corrections)
+    _demote_marked_items(kept, corrections)
 
     total = parsed.get("total_amount")
     layout_total = layout.total_amount

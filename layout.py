@@ -46,7 +46,7 @@ _LABEL_NAME = re.compile(
 )
 
 # 하위 옵션 접두 기호
-_SUB_PREFIX = re.compile(r"^[-*+└ㄴ>›~ㄴ]|^\(추가|^옵션")
+_SUB_PREFIX = re.compile(r"^[-*+└ㄴ>›»▶►▸~]|^\(추가|^옵션")
 
 
 @dataclass
@@ -243,7 +243,7 @@ def analyze_receipt(ocr_lines: list[dict]) -> Layout:
         if is_sub:
             if items:
                 items[-1].sub_items.append(
-                    LayoutSubItem(name=re.sub(r"^[-*+└>›~\s]+", "", name), price=price)
+                    LayoutSubItem(name=re.sub(r"^[-*+└>›»▶►▸~\s]+", "", name), price=price)
                 )
             continue
         if name and price is not None:
