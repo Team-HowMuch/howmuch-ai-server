@@ -22,7 +22,8 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from PIL import Image, ImageOps
 from pydantic import BaseModel, Field
 
-from corrector import KoreanCorrector
+from corrector import KoreanCorrector, _jamo_distance, _jamo_seq
+from layout import analyze_receipt
 
 MAX_SIDE = 1536
 
@@ -30,12 +31,13 @@ PROMPT = """이 한국 영수증 이미지를 읽고 아래 JSON 형식으로만
 {
   "store_name": "상호명",
   "purchased_at": "YYYY-MM-DD HH:MM",
-  "items": [{"name": "품목명", "quantity": 1, "price": 0}],
+  "items": [{"name": "품목명", "quantity": 1, "price": 0, "sub_items": [{"name": "옵션명", "price": 0}]}],
   "total_amount": 0,
   "payment_method": "카드 또는 현금"
 }
 규칙:
 - items에는 실제 구매한 상품만 넣어. 소계/부가세/과세물품가액/면세물품가액/합계/할인 같은 요약 줄은 품목이 아니야.
+- 품목 아래 들여쓰기나 -, * 기호로 붙는 옵션/추가선택(예: 샷추가, 사이즈업)은 별도 품목이 아니라 그 품목의 sub_items에 넣어. 없으면 빈 배열로 해.
 - 한국 영수증 날짜는 보통 년/월/일 순서야. 25/09/21은 2025-09-21이야.
 - 금액은 숫자만(콤마 없이) 적어.
 - 읽을 수 없는 값은 null로 해."""
@@ -53,10 +55,18 @@ app = FastAPI(
 )
 
 
+class SubReceiptItem(BaseModel):
+    name: str | None = Field(None, description="하위 옵션명", examples=["샷추가"])
+    price: int | None = Field(None, description="옵션 금액(원), 없으면 null", examples=[500])
+
+
 class ReceiptItem(BaseModel):
     name: str | None = Field(None, description="품목명 (보정 적용 후)", examples=["참치김밥"])
     quantity: int | None = Field(None, description="수량", examples=[1])
     price: int | None = Field(None, description="금액(원)", examples=[3500])
+    sub_items: list[SubReceiptItem] = Field(
+        default_factory=list, description="품목에 붙는 하위 옵션/추가선택 (좌표 기반 복원 포함)"
+    )
 
 
 class ReceiptResult(BaseModel):
@@ -77,7 +87,11 @@ class CorrectionEntry(BaseModel):
     before: str = Field(description="보정 전 (모델이 읽은 값)", examples=["잠치김밥"])
     after: str = Field(description="보정 후", examples=["참치김밥"])
     reason: str = Field(
-        description="보정 경로: ocr(OCR 교차검증) | confusion_swap(혼동 자모 치환)",
+        description=(
+            "보정 경로: ocr(OCR 교차검증) | confusion_swap(혼동 자모 치환) | "
+            "ocr_recovered(VLM 누락 품목을 좌표 기반으로 복구) | ocr_layout(좌표 기반 합계 보완) | "
+            "barcode_price_paired(품목명 줄과 바코드·금액 줄 병합)"
+        ),
         examples=["confusion_swap"],
     )
 
@@ -85,6 +99,9 @@ class CorrectionEntry(BaseModel):
 class OcrLine(BaseModel):
     text: str = Field(description="OCR이 인식한 텍스트 라인")
     confidence: float = Field(description="인식 신뢰도 (0~1)")
+    box: list[int] | None = Field(
+        None, description="텍스트 위치 [x1, y1, x2, y2] (리사이즈된 이미지 픽셀 기준)"
+    )
 
 
 class OcrReceiptResponse(BaseModel):
@@ -136,10 +153,16 @@ def _run_text_ocr(image_path: str) -> list[dict]:
         result = _ocr_engine(image_path)
     if result.txts is None:
         return []
-    return [
-        {"text": txt, "confidence": round(float(score), 3)}
-        for txt, score in zip(result.txts, result.scores)
-    ]
+    lines = []
+    for i, (txt, score) in enumerate(zip(result.txts, result.scores)):
+        entry = {"text": txt, "confidence": round(float(score), 3)}
+        if result.boxes is not None:
+            quad = result.boxes[i]  # 4점 사각형 -> 외접 박스
+            xs = [float(p[0]) for p in quad]
+            ys = [float(p[1]) for p in quad]
+            entry["box"] = [round(min(xs)), round(min(ys)), round(max(xs)), round(max(ys))]
+        lines.append(entry)
+    return lines
 
 
 def _parse_json(text: str):
@@ -164,36 +187,138 @@ _SUMMARY_LINE = re.compile(
 )
 
 
+def _names_match(a: str | None, b: str | None) -> bool:
+    """한글 기준으로 같은 품목명인지 판단 (포함 관계 또는 자모 편집거리)."""
+    na = re.sub(r"[^가-힣]", "", a or "")
+    nb = re.sub(r"[^가-힣]", "", b or "")
+    if not na or not nb:
+        return False
+    if na in nb or nb in na:
+        return True
+    return _jamo_distance(na, nb) <= max(2, len(_jamo_seq(na)) // 3)
+
+
+def _correct_name(item: dict, key: str, field_name: str, ocr_texts: list[str], corrections: list):
+    name = item.get(key)
+    if not name:
+        return
+    res = _corrector.correct(name, ocr_texts)
+    if res.changed:
+        item[key] = res.corrected
+        corrections.append(
+            {"field": field_name, "before": res.original, "after": res.corrected, "reason": res.reason}
+        )
+
+
+_BARCODE_NAME = re.compile(r"^[\d\s\-*]{8,}$")
+
+
+def _pair_orphan_prices(kept: list[dict], corrections: list):
+    """VLM이 '품목명 줄'과 '바코드·금액 줄'을 별도 품목으로 쪼갠 경우 하나로 합친다."""
+    i = 1
+    while i < len(kept):
+        item = kept[i]
+        name = (item.get("name") or "").strip()
+        prev = kept[i - 1]
+        if (
+            _BARCODE_NAME.match(name)
+            and (item.get("price") or 0) > 0
+            and prev.get("price") in (None, 0)
+            and re.search(r"[가-힣]", prev.get("name") or "")
+        ):
+            prev["price"] = item["price"]
+            if not prev.get("quantity") and item.get("quantity"):
+                prev["quantity"] = item["quantity"]
+            corrections.append(
+                {
+                    "field": "items",
+                    "before": name,
+                    "after": prev["name"],
+                    "reason": "barcode_price_paired",
+                }
+            )
+            kept.pop(i)
+            continue
+        i += 1
+
+
+def _apply_layout(kept: list[dict], layout, ocr_texts: list[str], corrections: list):
+    """좌표 기반 구조(layout)를 VLM 결과와 교차: 하위 옵션 부착 + 누락 품목 복구."""
+    for li in layout.items:
+        if li.name and _SUMMARY_LINE.match(li.name.strip()):
+            continue
+
+        matched = next(
+            (
+                it
+                for it in kept
+                if _names_match(it.get("name"), li.name)
+                or (li.price is not None and it.get("price") == li.price)
+            ),
+            None,
+        )
+
+        subs = [{"name": s.name, "price": s.price} for s in li.sub_items]
+        if matched is not None:
+            if subs and not matched.get("sub_items"):
+                matched["sub_items"] = subs
+            continue
+
+        # VLM이 놓친 품목 복구: 좌표상 품목 영역에서 이름+금액이 확실한 줄만
+        if (
+            li.name is None
+            or li.price is None
+            or li.name_confidence < 0.8
+            or len(re.sub(r"[^가-힣]", "", li.name)) < 2
+        ):
+            continue
+        res = _corrector.correct(li.name, ocr_texts)
+        name = res.corrected if res.changed else li.name
+        kept.append({"name": name, "quantity": li.quantity, "price": li.price, "sub_items": subs})
+        corrections.append(
+            {"field": "items", "before": "(VLM 누락)", "after": name, "reason": "ocr_recovered"}
+        )
+
+
 def _merge(parsed: dict, ocr_lines: list[dict]) -> tuple[dict, list[dict]]:
-    """VLM 결과의 품목명을 OCR 텍스트와 대조해 보정하고 합계를 교차 검증한다."""
+    """VLM 결과를 OCR 텍스트·좌표와 대조해 품목명 보정, 구조 복원, 합계 검증을 수행한다."""
     ocr_texts = [line["text"] for line in ocr_lines if line["confidence"] >= 0.8]
     corrections = []
+    layout = analyze_receipt(ocr_lines)
 
     items = parsed.get("items") or []
     kept = [it for it in items if not _SUMMARY_LINE.match((it.get("name") or "").strip())]
-    if len(kept) != len(items):
-        parsed["items"] = kept
+    parsed["items"] = kept
+    _pair_orphan_prices(kept, corrections)
 
     for item in kept:
-        name = item.get("name")
-        if not name:
-            continue
-        res = _corrector.correct(name, ocr_texts)
-        if res.changed:
-            item["name"] = res.corrected
-            corrections.append(
-                {
-                    "field": "item.name",
-                    "before": res.original,
-                    "after": res.corrected,
-                    "reason": res.reason,
-                }
-            )
+        item["sub_items"] = [s for s in (item.get("sub_items") or []) if isinstance(s, dict)]
+        _correct_name(item, "name", "item.name", ocr_texts, corrections)
+        for sub in item["sub_items"]:
+            _correct_name(sub, "name", "item.sub_items.name", ocr_texts, corrections)
+
+    _apply_layout(kept, layout, ocr_texts, corrections)
 
     total = parsed.get("total_amount")
-    parsed["total_verified"] = (
-        isinstance(total, (int, float)) and int(total) in _ocr_numbers(ocr_lines)
-    )
+    if isinstance(total, (int, float)):
+        if layout.total_amount is not None:
+            # "합계" 라벨 옆 숫자와 정확히 일치해야 검증 통과 (임의 숫자 일치 오검증 방지)
+            parsed["total_verified"] = int(total) == layout.total_amount
+        else:
+            parsed["total_verified"] = int(total) in _ocr_numbers(ocr_lines)
+    elif layout.total_amount is not None:
+        parsed["total_amount"] = layout.total_amount
+        parsed["total_verified"] = True
+        corrections.append(
+            {
+                "field": "total_amount",
+                "before": "null",
+                "after": str(layout.total_amount),
+                "reason": "ocr_layout",
+            }
+        )
+    else:
+        parsed["total_verified"] = False
     return parsed, corrections
 
 
