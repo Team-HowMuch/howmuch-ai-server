@@ -378,6 +378,56 @@ def _apply_layout(kept: list[dict], layout, ocr_texts: list[str], corrections: l
         )
 
 
+# VLM이 값을 못 찾을 때 프롬프트 예시를 그대로 돌려주는 경우
+_PLACEHOLDERS = {"store_name": "상호명", "payment_method": "카드 또는 현금", "purchased_at": "YYYY-MM-DD HH:MM"}
+
+
+def _scrub_placeholders(parsed: dict):
+    for key, placeholder in _PLACEHOLDERS.items():
+        if parsed.get(key) == placeholder:
+            parsed[key] = None
+
+
+def _merge_wrapped_names(kept: list[dict], corrections: list):
+    """줄바꿈으로 잘린 메뉴명 병합.
+
+    긴 메뉴명(예: '갓 튀긴 옛날통닭 + 콜라 + 치킨 무 [한그릇 세트]')이 두 줄로
+    인쇄되면 VLM이 두 품목으로 쪼갠다. 금액이 0원인데 하위 옵션을 거느린 품목은
+    실제 상품이 아니라 직전 품목명의 이어짐이므로 합친다.
+    """
+    i = 1
+    while i < len(kept):
+        item = kept[i]
+        prev = kept[i - 1]
+        if (
+            item.get("price") in (None, 0)
+            and item.get("sub_items")
+            and item.get("name")
+            and prev.get("price")
+        ):
+            joiner = " + " if "+" in (prev.get("name") or "") else " "
+            merged_name = f"{prev.get('name')}{joiner}{item['name']}"
+            corrections.append(
+                {
+                    "field": "item.name",
+                    "before": f"{prev.get('name')} / {item['name']}",
+                    "after": merged_name,
+                    "reason": "name_wrapped",
+                }
+            )
+            prev["name"] = merged_name
+            for sub in item["sub_items"]:
+                if not any(
+                    _names_match(x.get("name"), sub.get("name"))
+                    and x.get("price") == sub.get("price")
+                    for x in prev["sub_items"]
+                ):
+                    prev["sub_items"].append(sub)
+            kept.pop(i)
+            continue
+        i += 1
+
+
 _ITEM_MARKER = re.compile(r"^[▶►▸>›»└+*~]\s*|^-\s+")
 
 
@@ -432,13 +482,16 @@ def _merge(parsed: dict, ocr_lines: list[dict]) -> tuple[dict, list[dict]]:
     corrections = []
     layout = analyze_receipt(ocr_lines)
 
+    _scrub_placeholders(parsed)
     items = parsed.get("items") or []
     kept = [it for it in items if not _SUMMARY_LINE.match((it.get("name") or "").strip())]
     parsed["items"] = kept
     _pair_orphan_prices(kept, corrections)
-
     for item in kept:
         item["sub_items"] = [s for s in (item.get("sub_items") or []) if isinstance(s, dict)]
+    _merge_wrapped_names(kept, corrections)
+
+    for item in kept:
         _correct_name(item, "name", "item.name", ocr_texts, corrections)
         for sub in item["sub_items"]:
             if isinstance(sub.get("name"), str):

@@ -33,8 +33,8 @@ _REGION_END = re.compile(
     r"|주문금액|배달비|총결제|결제금액"
 )
 
-# 합계로 인정하는 라벨 (공백 제거 후 대조)
-_TOTAL_LABEL = re.compile(r"합계|총액|총구매|총결제|결제금액|받을금액")
+# 합계로 인정하는 라벨 (공백 제거 후 대조). 선결제는 배민 주문서의 결제액 줄.
+_TOTAL_LABEL = re.compile(r"합계|총액|총구매|총결제|결제금액|받을금액|선결제")
 
 # 강한 라벨이 없을 때만 쓰는 보조 합계 라벨 (배달 영수증의 주문금액 = 품목 합)
 _TOTAL_LABEL_WEAK = re.compile(r"주문금액")
@@ -231,8 +231,9 @@ def analyze_receipt(ocr_lines: list[dict]) -> Layout:
     for row in region:
         parsed = _parse_row(row)
         name, price, quantity = parsed["name"], parsed["price"], parsed["quantity"]
-        if name and _LABEL_NAME.search(re.sub(r"\s+", "", name)):
-            continue  # 요약/전표 라벨 줄은 품목도 pending도 아니다
+        compact_name = re.sub(r"\s+", "", name) if name else ""
+        if compact_name and (_LABEL_NAME.search(compact_name) or _TOTAL_LABEL.search(compact_name)):
+            continue  # 요약/전표/합계 라벨 줄은 품목도 pending도 아니다
         indent = (row.x1 - base_x) / char_w if char_w else 0.0
         is_sub = name is not None and (
             bool(_SUB_PREFIX.match(name))

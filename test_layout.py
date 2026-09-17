@@ -355,6 +355,53 @@ def test_demote_skipped_when_all_items_have_markers():
     assert [it["name"] for it in merged["items"]] == ["▶아메리카노", "▶카페라떼"]
 
 
+def test_merge_wrapped_menu_name_and_placeholder_scrub():
+    """줄바꿈으로 잘린 세트 메뉴명 병합 + VLM 플레이스홀더 제거 (치킨집 주문서 실측).
+
+    금액 0원인데 하위 옵션을 거느린 품목은 직전 품목명의 이어짐이다.
+    """
+    import server
+    from corrector import KoreanCorrector
+
+    if server._corrector is None:
+        server._corrector = KoreanCorrector()
+
+    parsed = {
+        "store_name": "상호명",  # VLM이 못 찾으면 프롬프트 예시를 그대로 돌려줌
+        "payment_method": "카드 또는 현금",
+        "items": [
+            {"name": "갓 튀긴 옛날통닭 + 콜라", "quantity": 1, "price": 12000, "sub_items": []},
+            {
+                "name": "치킨 무 [한그릇 세트]",
+                "quantity": 1,
+                "price": 0,
+                "sub_items": [
+                    {"name": "치킨 무 + 콜라 500ml", "price": 0},
+                    {"name": "양념소스 추가", "price": 500},
+                ],
+            },
+            {"name": "배달비", "quantity": 1, "price": 0, "sub_items": []},
+        ],
+        "total_amount": 12500,
+    }
+    ocr_lines = [
+        _line("배민배달선결제", 100, 100),
+        _line("12,500", 600, 100),
+    ]
+    merged, corrections = server._merge(parsed, ocr_lines)
+
+    names = [it["name"] for it in merged["items"]]
+    assert names == ["갓 튀긴 옛날통닭 + 콜라 + 치킨 무 [한그릇 세트]", "배달비"]
+    assert [(s["name"], s["price"]) for s in merged["items"][0]["sub_items"]] == [
+        ("치킨 무 + 콜라 500ml", 0),
+        ("양념소스 추가", 500),
+    ]
+    assert merged["store_name"] is None
+    assert merged["payment_method"] is None
+    assert merged["total_verified"] is True  # 선결제 라벨과 일치
+    assert any(c["reason"] == "name_wrapped" for c in corrections)
+
+
 def test_merge_total_mismatch_fails_verification():
     import server
     from corrector import KoreanCorrector
