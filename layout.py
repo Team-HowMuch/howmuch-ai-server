@@ -36,6 +36,9 @@ _REGION_END = re.compile(
 # 합계로 인정하는 라벨 (공백 제거 후 대조)
 _TOTAL_LABEL = re.compile(r"합계|총액|총구매|총결제|결제금액|받을금액")
 
+# 강한 라벨이 없을 때만 쓰는 보조 합계 라벨 (배달 영수증의 주문금액 = 품목 합)
+_TOTAL_LABEL_WEAK = re.compile(r"주문금액")
+
 # 품목이 될 수 없는 금액 라벨 줄 (카드 전표의 판매금액/부가세 등, 공백 제거 후 대조)
 _LABEL_NAME = re.compile(
     r"판매금액|받은금액|받을금액|거스름|매출표|승인번호|부가세|봉사료|공급가"
@@ -270,9 +273,18 @@ def analyze_receipt(ocr_lines: list[dict]) -> Layout:
         # 이름도 가격도 없는 줄(바코드 조각 등)은 무시
 
     total = None
+    weak_total = None
     for row in rows:
-        if _TOTAL_LABEL.search(row.compact):
+        compact = row.compact
+        if _TOTAL_LABEL.search(compact):
             value = _parse_row(row)["price"]
-            if value is not None:
+            # "받을금액: 0"(미수금) 같은 0원 라벨이 실제 합계를 덮어쓰지 않게 한다
+            if value is not None and (value > 0 or total is None):
                 total = value
+        elif _TOTAL_LABEL_WEAK.search(compact):
+            value = _parse_row(row)["price"]
+            if value is not None and (value > 0 or weak_total is None):
+                weak_total = value
+    if total is None:
+        total = weak_total
     return Layout(rows=rows, items=items, total_amount=total)

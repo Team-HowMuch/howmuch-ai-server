@@ -90,7 +90,9 @@ class CorrectionEntry(BaseModel):
         description=(
             "보정 경로: ocr(OCR 교차검증) | confusion_swap(혼동 자모 치환) | "
             "ocr_recovered(VLM 누락 품목을 좌표 기반으로 복구) | ocr_layout(좌표 기반 합계 보완) | "
-            "barcode_price_paired(품목명 줄과 바코드·금액 줄 병합)"
+            "barcode_price_paired(품목명 줄과 바코드·금액 줄 병합) | "
+            "sub_promoted(잘못 하위로 묶인 품목을 최상위로 승격) | "
+            "sub_reassigned(하위 옵션을 좌표상 실제 부모 품목으로 이동)"
         ),
         examples=["confusion_swap"],
     )
@@ -243,11 +245,106 @@ def _pair_orphan_prices(kept: list[dict], corrections: list):
 
 
 def _apply_layout(kept: list[dict], layout, ocr_texts: list[str], corrections: list):
-    """좌표 기반 구조(layout)를 VLM 결과와 교차: 하위 옵션 부착 + 누락 품목 복구."""
-    for li in layout.items:
-        if li.name and _SUMMARY_LINE.match(li.name.strip()):
-            continue
+    """좌표 기반 구조(layout)를 VLM 결과와 교차.
 
+    layout이 계층(최상위/하위)의 기준이다. VLM은 옵션 기호(>)에 끌려서
+    최상위 품목까지 한 품목의 하위로 묶는 오류를 낸다.
+    1. 승격: VLM이 하위로 넣었지만 layout상 최상위 품목이면 최상위로 꺼낸다.
+    2. 재배치: layout상 다른 품목 소속의 하위 항목은 그 품목으로 옮긴다.
+    3. 부착/복구: 하위 옵션 부착, VLM 누락 품목 복구.
+    """
+    layout_items = [
+        li for li in layout.items if not (li.name and _SUMMARY_LINE.match(li.name.strip()))
+    ]
+
+    def _layout_subs(li) -> list[dict]:
+        # 금액을 못 읽은 layout 하위 항목은 오독 잔재일 가능성이 높아 복사하지 않는다
+        return [{"name": s.name, "price": s.price} for s in li.sub_items if s.price is not None]
+
+    # 1) 승격: VLM 이름(오독이 적음)을 유지한 채 최상위 품목으로 꺼낸다
+    for v in list(kept):
+        remaining = []
+        for s in v.get("sub_items", []):
+            li = next(
+                (
+                    li
+                    for li in layout_items
+                    if li.price is not None
+                    and s.get("price") == li.price
+                    and _names_match(s.get("name"), li.name)
+                ),
+                None,
+            )
+            if li is None:
+                remaining.append(s)
+                continue
+            already = next(
+                (k for k in kept if k is not v and _names_match(k.get("name"), li.name)), None
+            )
+            if already is None:
+                kept.append(
+                    {
+                        "name": s.get("name"),
+                        "quantity": li.quantity,
+                        "price": s.get("price"),
+                        "sub_items": _layout_subs(li),
+                    }
+                )
+            corrections.append(
+                {
+                    "field": "items",
+                    "before": f"{v.get('name')} > {s.get('name')}",
+                    "after": s.get("name") or "",
+                    "reason": "sub_promoted",
+                }
+            )
+        v["sub_items"] = remaining
+
+    # 2) 재배치: layout이 다른 부모 소속이라고 판정한 하위 항목 이동
+    for v in kept:
+        lv = next((li for li in layout_items if _names_match(v.get("name"), li.name)), None)
+        if lv is None:
+            continue
+        remaining = []
+        for s in v["sub_items"]:
+            parent = next(
+                (
+                    li
+                    for li in layout_items
+                    if any(
+                        _names_match(s.get("name"), ls.name) and s.get("price") == ls.price
+                        for ls in li.sub_items
+                    )
+                ),
+                None,
+            )
+            if parent is not None and parent is not lv:
+                owner = next(
+                    (k for k in kept if _names_match(k.get("name"), parent.name)), None
+                )
+                if owner is not None:
+                    existing = next(
+                        (x for x in owner["sub_items"] if _names_match(x.get("name"), s.get("name"))),
+                        None,
+                    )
+                    if existing is not None:
+                        existing["name"] = s.get("name") or existing["name"]  # VLM 이름 우선
+                    else:
+                        owner["sub_items"].append(s)
+                    corrections.append(
+                        {
+                            "field": "items",
+                            "before": f"{v.get('name')} > {s.get('name')}",
+                            "after": f"{owner.get('name')} > {s.get('name')}",
+                            "reason": "sub_reassigned",
+                        }
+                    )
+                    continue
+            remaining.append(s)
+        v["sub_items"] = remaining
+
+    # 3) 부착 + 복구
+    for li in layout_items:
         matched = next(
             (
                 it
@@ -258,7 +355,7 @@ def _apply_layout(kept: list[dict], layout, ocr_texts: list[str], corrections: l
             None,
         )
 
-        subs = [{"name": s.name, "price": s.price} for s in li.sub_items]
+        subs = _layout_subs(li)
         if matched is not None:
             if subs and not matched.get("sub_items"):
                 matched["sub_items"] = subs
@@ -280,6 +377,17 @@ def _apply_layout(kept: list[dict], layout, ocr_texts: list[str], corrections: l
         )
 
 
+def _items_sum(items: list[dict]) -> int:
+    total = 0
+    for it in items:
+        if isinstance(it.get("price"), (int, float)):
+            total += int(it["price"])
+        for s in it.get("sub_items", []):
+            if isinstance(s.get("price"), (int, float)):
+                total += int(s["price"])
+    return total
+
+
 def _merge(parsed: dict, ocr_lines: list[dict]) -> tuple[dict, list[dict]]:
     """VLM 결과를 OCR 텍스트·좌표와 대조해 품목명 보정, 구조 복원, 합계 검증을 수행한다."""
     ocr_texts = [line["text"] for line in ocr_lines if line["confidence"] >= 0.8]
@@ -295,25 +403,44 @@ def _merge(parsed: dict, ocr_lines: list[dict]) -> tuple[dict, list[dict]]:
         item["sub_items"] = [s for s in (item.get("sub_items") or []) if isinstance(s, dict)]
         _correct_name(item, "name", "item.name", ocr_texts, corrections)
         for sub in item["sub_items"]:
+            if isinstance(sub.get("name"), str):
+                sub["name"] = re.sub(r"^[-*+└>›~\s]+", "", sub["name"])  # 옵션 기호 제거
             _correct_name(sub, "name", "item.sub_items.name", ocr_texts, corrections)
 
     _apply_layout(kept, layout, ocr_texts, corrections)
 
     total = parsed.get("total_amount")
+    layout_total = layout.total_amount
     if isinstance(total, (int, float)):
-        if layout.total_amount is not None:
-            # "합계" 라벨 옆 숫자와 정확히 일치해야 검증 통과 (임의 숫자 일치 오검증 방지)
-            parsed["total_verified"] = int(total) == layout.total_amount
+        t = int(total)
+        if layout_total is None:
+            parsed["total_verified"] = t in _ocr_numbers(ocr_lines)
+        elif t == layout_total:
+            # "합계" 라벨 옆 숫자와 정확히 일치 (임의 숫자 일치 오검증 방지)
+            parsed["total_verified"] = True
+        elif layout_total == _items_sum(kept):
+            # VLM 합계가 라벨·품목합 모두와 어긋남 (과세물품가액을 합계로 착각하는 유형)
+            # -> 라벨 값과 품목 합이 서로 일치하면 그 값을 채택
+            parsed["total_amount"] = layout_total
+            parsed["total_verified"] = True
+            corrections.append(
+                {
+                    "field": "total_amount",
+                    "before": str(t),
+                    "after": str(layout_total),
+                    "reason": "ocr_layout",
+                }
+            )
         else:
-            parsed["total_verified"] = int(total) in _ocr_numbers(ocr_lines)
-    elif layout.total_amount is not None:
-        parsed["total_amount"] = layout.total_amount
+            parsed["total_verified"] = False
+    elif layout_total is not None:
+        parsed["total_amount"] = layout_total
         parsed["total_verified"] = True
         corrections.append(
             {
                 "field": "total_amount",
                 "before": "null",
-                "after": str(layout.total_amount),
+                "after": str(layout_total),
                 "reason": "ocr_layout",
             }
         )
