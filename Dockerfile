@@ -10,7 +10,7 @@ WORKDIR /app
 COPY requirements-api.txt .
 RUN pip install --no-cache-dir -r requirements-api.txt
 
-COPY server.py vlm.py corrector.py ./
+COPY server.py vlm.py corrector.py layout.py ./
 COPY static ./static
 
 ENV VLM_BACKEND=openai
