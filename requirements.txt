@@ -11,3 +11,4 @@ python-multipart
 kiwipiepy
 rapidocr
 onnxruntime
+amplitude-ai==1.13.0

@@ -4,6 +4,7 @@ __pycache__/
 .DS_Store
 server.log
 *.zip
+.env
 
 # 개인 결제 정보가 담긴 실제 영수증 사진
 samples/

@@ -112,6 +112,7 @@ docker compose down             # 전체 종료 (모델 캐시는 유지)
 | `VLM_BACKEND` | openai | vLLM API 호출 모드 |
 | `VLM_API_BASE` | http://vllm:8000/v1 | vLLM 주소 |
 | `VLM_MODEL` | Qwen/Qwen2.5-VL-7B-Instruct-AWQ | 모델 교체 시 vllm 서비스 command도 함께 변경 |
+| `AMPLITUDE_AI_API_KEY` | (없음) | Amplitude Agent Analytics 키. `.env`에 설정 (미설정 시 dry-run으로 비활성화) |
 
 ## Spring 백엔드 연동 (추후)
 

@@ -13,6 +13,7 @@ import re
 import tempfile
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from pathlib import Path
@@ -22,6 +23,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from PIL import Image, ImageOps
 from pydantic import BaseModel, Field
 
+from amplitude_bootstrap import ai, agent
 from corrector import KoreanCorrector
 
 MAX_SIDE = 1536
@@ -127,7 +129,7 @@ def _load_models():
     print("모델 로드 완료")
 
 
-def _run_vlm(image_path: str) -> str:
+def _run_vlm(image_path: str):
     return _vlm.generate(image_path, PROMPT)
 
 
@@ -219,6 +221,9 @@ async def ocr_receipt(file: UploadFile = File(..., description="영수증 이미
     with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
         tmp_path = tmp.name
 
+    # 로그인 없는 익명 API라 사용자/대화 개념이 없다 — 요청 1건을 세션 1개로 취급한다.
+    request_id = uuid.uuid4().hex
+
     try:
         image = Image.open(BytesIO(raw))
         image = ImageOps.exif_transpose(image).convert("RGB")
@@ -227,16 +232,44 @@ async def ocr_receipt(file: UploadFile = File(..., description="영수증 이미
         image.save(tmp_path, "JPEG", quality=92)
 
         start = time.perf_counter()
-        vlm_future = _executor.submit(_run_vlm, tmp_path)
-        ocr_future = _executor.submit(_run_text_ocr, tmp_path)
-        raw_text = vlm_future.result()
-        ocr_lines = ocr_future.result()
-        elapsed = round(time.perf_counter() - start, 1)
+        async with agent.session(device_id=request_id, session_id=request_id) as s:
+            s.track_user_message("Extract structured data from a photographed Korean receipt")
 
-        parsed = _parse_json(raw_text)
-        corrections = []
-        if parsed is not None:
-            parsed, corrections = _merge(parsed, ocr_lines)
+            vlm_start = time.perf_counter()
+            vlm_future = _executor.submit(_run_vlm, tmp_path)
+            ocr_future = _executor.submit(_run_text_ocr, tmp_path)
+            try:
+                vlm_output = vlm_future.result()
+            except Exception as e:
+                s.track_ai_message(
+                    "",
+                    model=_vlm.model,
+                    provider=_vlm.provider,
+                    latency_ms=int((time.perf_counter() - vlm_start) * 1000),
+                    is_error=True,
+                    error_message=str(e),
+                )
+                raise
+            vlm_latency_ms = int((time.perf_counter() - vlm_start) * 1000)
+            ocr_lines = ocr_future.result()
+            elapsed = round(time.perf_counter() - start, 1)
+
+            parsed = _parse_json(vlm_output.text)
+            corrections = []
+            if parsed is not None:
+                parsed, corrections = _merge(parsed, ocr_lines)
+
+            s.track_ai_message(
+                content=vlm_output.text,
+                model=vlm_output.model,
+                provider=vlm_output.provider,
+                latency_ms=vlm_latency_ms,
+                input_tokens=vlm_output.input_tokens,
+                output_tokens=vlm_output.output_tokens,
+                total_tokens=vlm_output.total_tokens,
+                # mlx-local은 과금이 없는 온디바이스 추론이라 비용을 0으로 명시한다.
+                total_cost_usd=0 if vlm_output.provider == "mlx-local" else None,
+            )
 
         return JSONResponse(
             {
@@ -245,12 +278,13 @@ async def ocr_receipt(file: UploadFile = File(..., description="영수증 이미
                 "result": parsed,
                 "corrections": corrections,
                 "ocr_lines": ocr_lines,
-                "raw": raw_text,
+                "raw": vlm_output.text,
             }
         )
     except Exception as e:  # 실측용 서버라 원인 그대로 노출
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
     finally:
+        ai.flush()
         Path(tmp_path).unlink(missing_ok=True)
 
 
