@@ -48,12 +48,15 @@ _LABEL_NAME = re.compile(
 
 # 할인 어휘. 63장 실측에서 나온 것만 담았다.
 # `에누리`가 `할인`만큼 자주 나오고, 홈푸드마트는 `$특매할인`, 신세계는 `직원 에누리20%`처럼 쓴다.
-_DISCOUNT_WORD = re.compile(r"할인|에누리|쿠폰|특매|D/?C")
+# `말인`·`합인`은 OCR 오독이다. 실측: `다품말인 20%`(신세계), `쿠폰말인`(하나로마트),
+# `합인금액:`(홈푸드마트). `에누ㄹ`도 `에누리`가 자모로 깨진 것이다(이마트).
+# 셋 다 한국어에 없는 표기라 오탐 위험이 거의 없다.
+_DISCOUNT_WORD = re.compile(r"할인|말인|합인|에누리|에누ㄹ|쿠폰|특매|D/?C")
 
 # 합계부의 할인 "요약" 라벨. 품목별 할인 줄들의 합계를 다시 적은 것이라 또 빼면 이중차감이다.
 # 실측: `할인금액 : -1,510`(홈푸드마트), `총할인액 -12,000`·`쿠폰할인 -12,000`(하나로마트),
 # `할인(에누리) -23,980`(홈플러스), `에누리계 -22,240`(신세계)
-_DISCOUNT_TOTAL_LABEL = re.compile(r"할인금액|총할인|할인계|할인액|에누리계|할인\(에누리\)|쿠폰할인")
+_DISCOUNT_TOTAL_LABEL = re.compile(r"할인금액|합인금액|총할인|할인계|할인액|에누리계|할인\(에누리\)|쿠폰할인|쿠폰말인")
 
 # 할인처럼 보이지만 할인이 아닌 줄.
 # `할인: 0, 현재잔액: 5,000` 은 농·축산물 할인지원금 한도 안내이고,
@@ -118,6 +121,9 @@ class LayoutItem:
     name_confidence: float = 1.0
     #: 이 품목 줄에 귀속되는 할인액. 항상 0 이상이고, price 는 할인 **전** 금액이다.
     discount: int = 0
+    #: 위 discount 를 이룬 개별 할인 금액들. VLM 이 같은 할인 줄을 sub_items 로도
+    #: 올려보내기 때문에, 금액 단위로 대조해야 같은 돈을 두 번 빼지 않는다.
+    discount_amounts: list[int] = field(default_factory=list)
 
 
 @dataclass
@@ -127,6 +133,10 @@ class Layout:
     total_amount: int | None
     #: 특정 품목에 귀속되지 않는 영수증 전체 단위 할인액. 항상 0 이상.
     discount: int = 0
+    #: 합계부 할인 "요약" 줄들의 합(상계 전 원값). 요약줄은 품목별 할인의 재기재라
+    #: 품목 합과 대조해야 하는데, VLM 이 같은 줄을 하위 옵션으로도 올려보내기 때문에
+    #: 병합 단계에서 한 번 더 대조하려면 상계 전 값이 필요하다.
+    summary_discount: int = 0
 
 
 def _to_tokens(ocr_lines: list[dict]) -> list[Token]:
@@ -282,6 +292,7 @@ def analyze_receipt(ocr_lines: list[dict]) -> Layout:
         if kind == "item":
             if items:
                 items[-1].discount += abs(price)
+                items[-1].discount_amounts.append(abs(price))
             else:
                 summary_discount += abs(price)  # 귀속할 품목이 없으면 전체 할인으로 본다
             continue
@@ -353,4 +364,10 @@ def analyze_receipt(ocr_lines: list[dict]) -> Layout:
                 weak_total = value
     if total is None:
         total = weak_total
-    return Layout(rows=rows, items=items, total_amount=total, discount=receipt_discount)
+    return Layout(
+        rows=rows,
+        items=items,
+        total_amount=total,
+        discount=receipt_discount,
+        summary_discount=summary_discount,
+    )

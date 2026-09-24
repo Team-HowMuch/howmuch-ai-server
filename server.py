@@ -23,7 +23,7 @@ from PIL import Image, ImageOps
 from pydantic import BaseModel, Field
 
 from corrector import KoreanCorrector, _jamo_distance, _jamo_seq
-from layout import analyze_receipt
+from layout import analyze_receipt, _discount_kind
 
 MAX_SIDE = 1536
 
@@ -110,7 +110,8 @@ class CorrectionEntry(BaseModel):
             "barcode_price_paired(품목명 줄과 바코드·금액 줄 병합) | "
             "sub_promoted(잘못 하위로 묶인 품목을 최상위로 승격) | "
             "sub_reassigned(하위 옵션을 좌표상 실제 부모 품목으로 이동) | "
-            "sub_demoted(옵션 마커가 남은 품목을 직전 품목의 하위로 강등)"
+            "sub_demoted(옵션 마커가 남은 품목을 직전 품목의 하위로 강등) | "
+            "discount_from_sub(하위 옵션으로 잘못 올라온 할인 줄을 discount 로 이동)"
         ),
         examples=["confusion_swap"],
     )
@@ -380,6 +381,7 @@ def _apply_layout(kept: list[dict], layout, ocr_texts: list[str], corrections: l
             # 할인은 좌표 기반 layout 만 안다. VLM 응답에는 할인 필드가 없다.
             if li.discount:
                 matched["discount"] = li.discount
+                matched["_discount_amounts"] = list(li.discount_amounts)
             continue
 
         # VLM이 놓친 품목 복구: 좌표상 품목 영역에서 이름+금액이 확실한 줄만
@@ -399,6 +401,7 @@ def _apply_layout(kept: list[dict], layout, ocr_texts: list[str], corrections: l
                 "price": li.price,
                 "sub_items": subs,
                 "discount": li.discount,
+                "_discount_amounts": list(li.discount_amounts),
             }
         )
         corrections.append(
@@ -493,6 +496,76 @@ def _demote_marked_items(kept: list[dict], corrections: list):
         )
 
 
+def _fold_discount_subitems(kept: list[dict], corrections: list) -> int:
+    """VLM 이 sub_items 로 올려보낸 할인 줄을 item.discount 로 접는다.
+
+    VLM 프롬프트에는 할인 필드가 없어서, 모델은 `$특매할인 -400` 같은 줄을 들여쓰기된
+    옵션으로 보고 sub_items 에 음수 금액으로 넣는다. 신세계처럼 이름까지 잃고
+    `옵션 -27,800` 으로 오는 경우도 있다. 그대로 두면 같은 할인이 sub_items 와
+    discount 양쪽에 남아 백엔드·프론트가 두 번 빼게 된다.
+
+    금액 단위로 대조해 중복을 지운다. layout 이 이미 센 금액과 같은 값이면 한 번만
+    센다. 이름에 할인 어휘가 없어도 금액이 음수인 하위 항목은 할인으로 본다.
+    실측 63장에서 음수 하위 항목은 전부 할인이었다.
+
+    이름이 합계부 요약 라벨(`합인금액:`, `총할인액` 등)인 하위 항목은 품목 할인이
+    아니라 **영수증 전체 요약**이 잘못 붙은 것이다. 품목에 더하면 같은 돈이 품목
+    할인과 요약 양쪽에 남는다. 그런 값은 품목이 아니라 반환값으로 돌려보내
+    호출부가 품목 할인 합과 대조하게 한다.
+
+    반환값: 하위 항목에서 건진 요약 할인액의 합.
+    """
+    summary_from_subs = 0
+    for item in kept:
+        # layout 이 이 품목에 귀속시킨 개별 할인 금액들. item["discount"] 는 이미 이 합이다.
+        counted = [int(a) for a in item.pop("_discount_amounts", [])]
+        folded: list[tuple[str | None, int, bool]] = []
+        remaining = []
+        for sub in item.get("sub_items", []):
+            price = sub.get("price")
+            if not isinstance(price, (int, float)) or not price:
+                remaining.append(sub)
+                continue
+            price = int(price)
+            # 음수 금액이거나 이름이 할인 어휘면 할인으로 본다.
+            if price >= 0 and _discount_kind(sub.get("name"), price) is None:
+                remaining.append(sub)
+                continue
+            amount = abs(price)
+            if _discount_kind(sub.get("name"), price) == "total":
+                # 합계부 요약줄이 하위로 잘못 붙은 것 — 품목이 아니라 영수증 단위다
+                summary_from_subs += amount
+                corrections.append(
+                    {
+                        "field": "item.sub_items",
+                        "before": f"{item.get('name')} / {sub.get('name')} -{amount:,}",
+                        "after": "영수증 단위 할인 요약으로 분리",
+                        "reason": "discount_from_sub",
+                    }
+                )
+                continue
+            duplicate = amount in counted
+            if duplicate:
+                counted.remove(amount)  # layout 이 이미 센 같은 할인 — 더하지 않는다
+            folded.append((sub.get("name"), amount, duplicate))
+        item["sub_items"] = remaining
+        if not folded:
+            continue
+        extra = sum(amount for _, amount, duplicate in folded if not duplicate)
+        item["discount"] = int(item.get("discount") or 0) + extra
+        for name, amount, duplicate in folded:
+            corrections.append(
+                {
+                    "field": "item.discount",
+                    "before": f"sub_items: {name} -{amount:,}",
+                    "after": ("discount 에 이미 반영됨 (중복 제거)" if duplicate
+                              else f"discount: {amount:,}"),
+                    "reason": "discount_from_sub",
+                }
+            )
+    return summary_from_subs
+
+
 def _items_sum(items: list[dict]) -> int:
     """품목 합계. price 는 할인 전 금액이므로 귀속 할인을 여기서 뺀다.
 
@@ -534,13 +607,21 @@ def _merge(parsed: dict, ocr_lines: list[dict]) -> tuple[dict, list[dict]]:
 
     _apply_layout(kept, layout, ocr_texts, corrections)
     _demote_marked_items(kept, corrections)
+    summary_from_subs = _fold_discount_subitems(kept, corrections)
 
-    # 할인은 전부 좌표 기반 layout 에서 온다. VLM 프롬프트에는 할인 필드가 없어서
-    # 모델이 할인 줄을 품목으로 올리거나 통째로 빠뜨린다.
+    # 할인은 좌표 기반 layout 과, VLM 이 하위 옵션으로 잘못 올린 줄에서 온다.
+    # VLM 프롬프트에는 할인 필드가 없어서 모델이 할인 줄을 옵션으로 보거나 빠뜨린다.
     for item in kept:
         value = item.get("discount")
         item["discount"] = int(value) if isinstance(value, (int, float)) and value > 0 else 0
-    parsed["discount"] = layout.discount
+
+    # 영수증 단위 할인 = 요약줄이 말하는 총 할인 - 이미 품목에 귀속시킨 할인.
+    # 요약줄은 같은 할인을 다시 적은 것이므로 그대로 더하면 이중계상이다. 좌표에서
+    # 본 요약값과 하위 옵션에서 건진 요약값 중 큰 쪽을 총 할인으로 본다(같은 줄을
+    # 양쪽에서 봤을 뿐이지 서로 더할 값이 아니다).
+    item_discount_sum = sum(item["discount"] for item in kept)
+    summary_total = max(layout.summary_discount, summary_from_subs)
+    parsed["discount"] = max(0, summary_total - item_discount_sum)
 
     total = parsed.get("total_amount")
     layout_total = layout.total_amount

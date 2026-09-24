@@ -633,3 +633,95 @@ def test_merge_without_discount_keeps_previous_behaviour():
     assert merged["discount"] == 0
     assert all(i["discount"] == 0 for i in merged["items"])
     assert merged["total_verified"] is True
+
+
+def test_discount_word_tolerates_ocr_misreads():
+    """실측 오독: `다품말인 20%`(신세계), `쿠폰말인`(하나로마트), `합인금액:`(홈푸드마트)."""
+    from layout import _discount_kind
+
+    assert _discount_kind("다품말인 20%", -27800) == "item"
+    assert _discount_kind("쿠폰말인", -12000) == "total"
+    assert _discount_kind("합인금액:", -520) == "total"
+    assert _discount_kind("에누ㄹ1()2604260014760", -4000) == "item"
+    # 오독 어휘가 실재 단어를 잡아먹지 않는지
+    assert _discount_kind("말인당 1인분", 9000) == "item"  # `말인`이 들어가면 할인으로 본다
+    assert _discount_kind("합계", 9000) is None
+
+
+def test_merge_folds_unnamed_negative_subitem_into_item_discount():
+    """신세계형: VLM 이 할인 줄의 이름을 잃고 `옵션 -27,800` 으로 올려보낸다.
+
+    이름에 할인 어휘가 없어도 음수 하위 항목은 할인이다. 실측 63장에서 음수
+    하위 항목은 전부 할인이었다.
+    """
+    import server
+    from corrector import KoreanCorrector
+
+    if server._corrector is None:
+        server._corrector = KoreanCorrector()
+    ocr_lines = _HEADER + [
+        _line("나이키트레이닝", 100, 150),
+        _line("139,000", 600, 150),
+        _line("직원 에누리20%", 130, 200),
+        _line("-22,240", 600, 200),
+        _line("계", 100, 300),
+        _line("88,960", 600, 300),
+    ]
+    parsed = {
+        "items": [
+            {
+                "name": "나이키 트레이닝",
+                "quantity": 1,
+                "price": 139000,
+                "sub_items": [{"name": "옵션", "price": -27800}, {"name": "옵션", "price": -22240}],
+            }
+        ],
+        "total_amount": 88960,
+    }
+    merged, corrections = server._merge(parsed, ocr_lines)
+    item = merged["items"][0]
+    assert item["price"] == 139000
+    assert item["discount"] == 50040
+    assert item["sub_items"] == []  # 할인은 옵션이 아니다
+    assert merged["discount"] == 0  # 품목에 귀속됐으므로 영수증 단위 할인은 없다
+    assert any(c["reason"] == "discount_from_sub" for c in corrections)
+
+
+def test_merge_summary_label_subitem_is_not_charged_to_the_item():
+    """홈푸드마트형: 합계부 요약줄 `합인금액: -520` 이 엉뚱한 품목의 하위로 붙는다.
+
+    같은 520 이 품목 할인($특매할인)·요약줄·영수증 단위에 세 번 세지면 안 된다.
+    """
+    import server
+    from corrector import KoreanCorrector
+
+    if server._corrector is None:
+        server._corrector = KoreanCorrector()
+    ocr_lines = _HEADER + [
+        _line("CJ)맛밤 36g", 100, 150),
+        _line("2,500", 600, 150),
+        _line("$특매할인", 130, 200),
+        _line("-520", 600, 200),
+        _line("정성)쫑디기 95g", 100, 250),
+        _line("1,000", 600, 250),
+        _line("합계", 100, 300),
+        _line("2,980", 600, 300),
+        _line("합인금액:", 100, 350),
+        _line("-520", 600, 350),
+    ]
+    parsed = {
+        "items": [
+            {"name": "CJ)맛밤 36g", "quantity": 1, "price": 2500,
+             "sub_items": [{"name": "$특매할인", "price": -520}]},
+            {"name": "정성)쫑디기 95g", "quantity": 1, "price": 1000,
+             "sub_items": [{"name": "합인금액:", "price": -520}]},
+        ],
+        "total_amount": 2980,
+    }
+    merged, _ = server._merge(parsed, ocr_lines)
+    assert [(i["name"], i["discount"]) for i in merged["items"]] == [
+        ("CJ)맛밤 36g", 520),
+        ("정성)쫑디기 95g", 0),  # 요약줄은 이 품목의 할인이 아니다
+    ]
+    assert merged["discount"] == 0  # 요약줄이 말하는 520 은 이미 품목에 있다
+    assert all(i["sub_items"] == [] for i in merged["items"])
