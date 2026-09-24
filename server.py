@@ -620,12 +620,21 @@ async def ocr_receipt(file: UploadFile = File(..., description="영수증 이미
 
         parsed = _parse_json(raw_text)
         corrections = []
+        error = None
         if parsed is not None:
             parsed, corrections = _merge(parsed, ocr_lines)
+        else:
+            # ok=false 만 내려보내면 원인을 알 수 없다. 실측에서 토큰 한도로 JSON 이
+            # 잘린 경우가 있었는데 응답만 보고는 구분이 안 됐다.
+            error = (
+                "VLM 응답을 JSON 으로 읽지 못했습니다 "
+                f"(길이 {len(raw_text or '')}자, 끝: {(raw_text or '')[-40:]!r})"
+            )
 
         return JSONResponse(
             {
                 "ok": parsed is not None,
+                "error": error,
                 "elapsed_sec": elapsed,
                 "result": parsed,
                 "corrections": corrections,

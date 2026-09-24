@@ -13,6 +13,13 @@ import threading
 import httpx
 
 
+
+# 품목이 많은 영수증은 800 토큰 안에 JSON 이 안 끝난다. 실측에서 품목 20개짜리
+# 하나로마트 영수증이 정확히 여기서 잘려 JSON 파싱에 실패했고, 응답이 통째로
+# ok=false 로 떨어졌다. 그 영수증의 출력이 약 800 토큰이라 여유를 둬 2048 로 올린다.
+# vLLM 의 --max-model-len 8192 안이라 컨텍스트에는 영향이 없다.
+_MAX_TOKENS = 2048
+
 class MlxVlm:
     def __init__(self, model_id: str):
         from mlx_vlm import load
@@ -23,7 +30,7 @@ class MlxVlm:
         self._config = load_config(model_id)
         self._lock = threading.Lock()
 
-    def generate(self, image_path: str, prompt: str, max_tokens: int = 800) -> str:
+    def generate(self, image_path: str, prompt: str, max_tokens: int = _MAX_TOKENS) -> str:
         from mlx_vlm import generate
         from mlx_vlm.prompt_utils import apply_chat_template
 
@@ -50,7 +57,7 @@ class OpenAIVlm:
         self._client = httpx.Client(timeout=timeout)
         print(f"VLM 백엔드 (OpenAI 호환): {self._base_url} / {model}")
 
-    def generate(self, image_path: str, prompt: str, max_tokens: int = 800) -> str:
+    def generate(self, image_path: str, prompt: str, max_tokens: int = _MAX_TOKENS) -> str:
         with open(image_path, "rb") as f:
             b64 = base64.b64encode(f.read()).decode()
         payload = {
