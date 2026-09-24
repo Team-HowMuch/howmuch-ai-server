@@ -92,6 +92,18 @@ def test_discount_line_attaches_as_sub():
     assert [(s.name, s.price) for s in layout.items[0].sub_items] == [("행사할인", -1000)]
 
 
+def test_money_accepts_won_sign_and_suffix():
+    """실측 금액 표기: -₩4,195(쿠팡이츠), 10,500원(EGG DROP), ₩4,900(StoryWay)."""
+    from layout import _money_value
+
+    assert _money_value("-₩4,195") == -4195
+    assert _money_value("10,500원") == 10500
+    assert _money_value("₩4,900") == 4900
+    assert _money_value("-520") == -520
+    assert _money_value("1,200)") is None  # 옵션 금액의 닫는 괄호 — 음수 아님
+    assert _money_value("△1,000") is None  # 63장에서 0건, 도입하지 않는다
+
+
 def test_total_from_label_row():
     lines = _HEADER + [
         _line("유니클로(과세)", 100, 150),

@@ -16,7 +16,8 @@ from dataclasses import dataclass, field
 from statistics import median
 
 _BARCODE = re.compile(r"^\d{8,}$")
-_MONEY = re.compile(r"^-?\d{1,3}(?:,\d{3})+$|^-?\d{3,7}$")
+# 실측 표기: -4,195 / -₩4,195(쿠팡이츠) / 10,500원(EGG DROP) / ₩4,900(StoryWay)
+_MONEY = re.compile(r"^-?₩?\d{1,3}(?:,\d{3})+원?$|^-?₩?\d{3,7}원?$")
 _PLAIN_INT = re.compile(r"^\d{1,3}$")
 _HANGUL = re.compile(r"[가-힣]")
 
@@ -155,7 +156,7 @@ def _money_value(text: str) -> int | None:
     if _BARCODE.match(text):
         return None
     if _MONEY.match(text):
-        return int(text.replace(",", ""))
+        return int(text.replace(",", "").replace("₩", "").replace("원", ""))
     return None
 
 
