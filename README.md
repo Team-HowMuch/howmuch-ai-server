@@ -50,13 +50,34 @@ python3 -m venv .venv
   "elapsed_sec": 3.2,
   "result": {
     "store_name": "...", "purchased_at": "YYYY-MM-DD HH:MM",
-    "items": [{"name": "...", "quantity": 1, "price": 0}],
+    "items": [{"name": "...", "quantity": 1, "price": 0, "discount": 0,
+               "sub_items": [{"name": "...", "price": 0}]}],
+    "discount": 0,
     "total_amount": 0, "payment_method": "...", "total_verified": true
   },
   "corrections": [{"field": "item.name", "before": "잠치김밥", "after": "참치김밥", "reason": "ocr"}],
   "ocr_lines": [{"text": "...", "confidence": 0.98}]
 }
 ```
+
+### 할인 필드
+
+| 필드 | 뜻 |
+|---|---|
+| `items[].price` | 할인 **전** 금액 |
+| `items[].discount` | 그 품목 줄에 귀속되는 할인액 (0 이상, 없으면 0) |
+| `discount` | 특정 품목에 귀속되지 않는 영수증 전체 단위 할인액 (0 이상, 없으면 0) |
+
+검증식 `Σ(price − items[].discount) − discount == total_amount` 이 성립하면
+`total_verified: true` 가 된다.
+
+할인은 항상 **양수**로 내려간다. 영수증이 `-1,510`으로 찍든 `3,000`으로 찍든
+서버가 부호를 정규화한다. 배달팁 할인·포인트 사용·상품권 사용은 할인이 아니라서
+이 필드에 들어가지 않는다(전자는 배달팁 순액에 이미 상계되어 있고,
+후자는 결제수단 분할이라 총액이 바뀌지 않는다).
+
+`sub_items` 는 품목에 붙는 하위 옵션(추가선택·사이즈업 등)이고 **할인이 아니다**.
+할인 줄은 `sub_items` 가 아니라 `discount` 로 간다.
 
 `GET /` — 폰 카메라 촬영 테스트 페이지
 
