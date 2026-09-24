@@ -63,7 +63,16 @@ class SubReceiptItem(BaseModel):
 class ReceiptItem(BaseModel):
     name: str | None = Field(None, description="품목명 (보정 적용 후)", examples=["참치김밥"])
     quantity: int | None = Field(None, description="수량", examples=[1])
-    price: int | None = Field(None, description="금액(원)", examples=[3500])
+    price: int | None = Field(None, description="할인 **전** 금액(원)", examples=[3500])
+    discount: int = Field(
+        0,
+        description=(
+            "이 품목에 귀속되는 할인액(원). 항상 0 이상이고 없으면 0. "
+            "실제로 낸 금액은 price - discount 다. 영수증 품목 줄 바로 아래 붙는 "
+            "행사할인·특매할인·에누리 줄이 여기로 들어온다."
+        ),
+        examples=[500],
+    )
     sub_items: list[SubReceiptItem] = Field(
         default_factory=list, description="품목에 붙는 하위 옵션/추가선택 (좌표 기반 복원 포함)"
     )
@@ -75,7 +84,15 @@ class ReceiptResult(BaseModel):
         None, description="구매 일시 (YYYY-MM-DD HH:MM, 시각이 없으면 날짜만)", examples=["2025-10-03 16:47"]
     )
     items: list[ReceiptItem] = Field(default_factory=list, description="구매 품목 목록")
-    total_amount: int | None = Field(None, description="합계 금액(원)", examples=[60000])
+    discount: int = Field(
+        0,
+        description=(
+            "특정 품목에 귀속되지 않는 영수증 전체 단위 할인액(원). 항상 0 이상이고 없으면 0. "
+            "품목별 할인은 items[].discount 에 따로 담기므로 여기에 중복해서 넣지 않는다."
+        ),
+        examples=[1000],
+    )
+    total_amount: int | None = Field(None, description="할인이 모두 반영된 최종 결제 금액(원)", examples=[60000])
     payment_method: str | None = Field(None, description="결제 수단", examples=["카드"])
     total_verified: bool = Field(
         False, description="합계 금액이 OCR 인식 숫자와 일치하는지 (true면 신뢰도 높음)"
@@ -360,6 +377,9 @@ def _apply_layout(kept: list[dict], layout, ocr_texts: list[str], corrections: l
         if matched is not None:
             if subs and not matched.get("sub_items"):
                 matched["sub_items"] = subs
+            # 할인은 좌표 기반 layout 만 안다. VLM 응답에는 할인 필드가 없다.
+            if li.discount:
+                matched["discount"] = li.discount
             continue
 
         # VLM이 놓친 품목 복구: 좌표상 품목 영역에서 이름+금액이 확실한 줄만
@@ -372,7 +392,15 @@ def _apply_layout(kept: list[dict], layout, ocr_texts: list[str], corrections: l
             continue
         res = _corrector.correct(li.name, ocr_texts)
         name = res.corrected if res.changed else li.name
-        kept.append({"name": name, "quantity": li.quantity, "price": li.price, "sub_items": subs})
+        kept.append(
+            {
+                "name": name,
+                "quantity": li.quantity,
+                "price": li.price,
+                "sub_items": subs,
+                "discount": li.discount,
+            }
+        )
         corrections.append(
             {"field": "items", "before": "(VLM 누락)", "after": name, "reason": "ocr_recovered"}
         )
@@ -466,6 +494,11 @@ def _demote_marked_items(kept: list[dict], corrections: list):
 
 
 def _items_sum(items: list[dict]) -> int:
+    """품목 합계. price 는 할인 전 금액이므로 귀속 할인을 여기서 뺀다.
+
+    예전에는 할인이 sub_items 안에 음수로 들어와 우연히 상계됐는데, 합계부 요약줄까지
+    하위로 붙는 바람에 같은 할인이 두 번 빠졌다. 이제 할인은 discount 로만 센다.
+    """
     total = 0
     for it in items:
         if isinstance(it.get("price"), (int, float)):
@@ -473,6 +506,7 @@ def _items_sum(items: list[dict]) -> int:
         for s in it.get("sub_items", []):
             if isinstance(s.get("price"), (int, float)):
                 total += int(s["price"])
+        total -= int(it.get("discount") or 0)
     return total
 
 
@@ -501,6 +535,13 @@ def _merge(parsed: dict, ocr_lines: list[dict]) -> tuple[dict, list[dict]]:
     _apply_layout(kept, layout, ocr_texts, corrections)
     _demote_marked_items(kept, corrections)
 
+    # 할인은 전부 좌표 기반 layout 에서 온다. VLM 프롬프트에는 할인 필드가 없어서
+    # 모델이 할인 줄을 품목으로 올리거나 통째로 빠뜨린다.
+    for item in kept:
+        value = item.get("discount")
+        item["discount"] = int(value) if isinstance(value, (int, float)) and value > 0 else 0
+    parsed["discount"] = layout.discount
+
     total = parsed.get("total_amount")
     layout_total = layout.total_amount
     if isinstance(total, (int, float)):
@@ -510,9 +551,9 @@ def _merge(parsed: dict, ocr_lines: list[dict]) -> tuple[dict, list[dict]]:
         elif t == layout_total:
             # "합계" 라벨 옆 숫자와 정확히 일치 (임의 숫자 일치 오검증 방지)
             parsed["total_verified"] = True
-        elif layout_total == _items_sum(kept):
+        elif layout_total == _items_sum(kept) - parsed["discount"]:
             # VLM 합계가 라벨·품목합 모두와 어긋남 (과세물품가액을 합계로 착각하는 유형)
-            # -> 라벨 값과 품목 합이 서로 일치하면 그 값을 채택
+            # -> 라벨 값과 (품목합 - 할인)이 서로 일치하면 그 값을 채택
             parsed["total_amount"] = layout_total
             parsed["total_verified"] = True
             corrections.append(

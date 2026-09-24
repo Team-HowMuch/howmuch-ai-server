@@ -79,7 +79,12 @@ def test_sub_item_by_indent():
     assert [(s.name, s.price) for s in layout.items[0].sub_items] == [("사이즈업", 500)]
 
 
-def test_discount_line_attaches_as_sub():
+def test_discount_line_becomes_item_discount_not_sub():
+    """할인 줄은 하위 옵션이 아니라 그 품목의 discount 다.
+
+    sub_items 에 음수로 넣으면 품목 합에 섞여, 할인을 따로 셀 수 없고 앱도
+    옵션과 구분하지 못한다. price 는 할인 전 금액으로 남는다.
+    """
     lines = [
         _line("케이크", 100, 100),
         _line("1", 400, 100),
@@ -89,7 +94,79 @@ def test_discount_line_attaches_as_sub():
     ]
     layout = analyze_receipt(lines)
     assert len(layout.items) == 1
-    assert [(s.name, s.price) for s in layout.items[0].sub_items] == [("행사할인", -1000)]
+    assert layout.items[0].price == 15000
+    assert layout.items[0].discount == 1000
+    assert layout.items[0].sub_items == []
+    assert layout.discount == 0
+
+
+def test_summary_discount_row_is_not_double_counted():
+    """합계부 `할인금액` 요약줄은 품목별 할인의 재기재이므로 또 빼지 않는다.
+
+    예전에는 이 줄이 직전 품목의 하위 옵션(-1,510)으로 붙어 품목 합에서 할인이
+    두 번 빠졌다. 실측 홈푸드마트 영수증이 `할인금액 : -1,510` 다음에 `과세물품`을
+    찍기 때문에 품목 영역 안에서 만난다.
+    """
+    lines = _HEADER + [
+        _line("미니꿀약과", 100, 150),
+        _line("2,500", 600, 150),
+        _line("$특매할인", 130, 200),
+        _line("-1,510", 600, 200),
+        _line("콘칩", 100, 250),
+        _line("1,000", 600, 250),
+        _line("할인금액", 100, 300),
+        _line("-1,510", 600, 300),
+        _line("합계", 100, 350),
+        _line("1,990", 600, 350),
+    ]
+    layout = analyze_receipt(lines)
+    assert [(i.name, i.price, i.discount) for i in layout.items] == [
+        ("미니꿀약과", 2500, 1510),
+        ("콘칩", 1000, 0),
+    ]
+    assert layout.discount == 0  # 요약줄은 품목별 합과 같으므로 버린다
+    assert layout.total_amount == 1990
+
+
+def test_receipt_level_discount_after_item_region():
+    """배달앱은 할인을 품목 영역이 끝난 뒤 부호 없는 양수로 찍는다."""
+    lines = _HEADER + [
+        _line("파스타", 100, 150),
+        _line("12,900", 600, 150),
+        _line("소계금액", 100, 200),
+        _line("16,000", 600, 200),
+        _line("할인금액", 100, 250),
+        _line("3,000", 600, 250),
+        _line("합계금액", 100, 300),
+        _line("13,000", 600, 300),
+    ]
+    layout = analyze_receipt(lines)
+    assert layout.discount == 3000
+    assert all(i.discount == 0 for i in layout.items)
+    assert layout.total_amount == 13000
+
+
+def test_zero_and_decoy_discount_rows_are_ignored():
+    """금액 0인 자리표시자와 할인이 아닌 `할인` 줄은 세지 않는다.
+
+    실측: `할인: 0, 현재잔액: 5,000`(농·축산물 지원금 한도), `할  인  0`(무인 POS),
+    `배달팁 할인 -1,900`(배달팁 순액 안에서 이미 상계됨).
+    """
+    lines = _HEADER + [
+        _line("아이스크림", 100, 150),
+        _line("5,300", 600, 150),
+        _line("할인", 100, 200),
+        _line("0", 600, 200),
+        _line("현재잔액", 100, 250),
+        _line("5,000", 600, 250),
+        _line("배달팁 할인", 100, 300),
+        _line("-1,900", 600, 300),
+        _line("합계", 100, 350),
+        _line("5,300", 600, 350),
+    ]
+    layout = analyze_receipt(lines)
+    assert layout.discount == 0
+    assert all(i.discount == 0 for i in layout.items)
 
 
 def test_money_accepts_won_sign_and_suffix():
@@ -464,3 +541,95 @@ def test_merge_adopts_label_total_when_it_matches_items_sum():
     assert merged["total_amount"] == 4500
     assert merged["total_verified"] is True
     assert any(c["reason"] == "ocr_layout" for c in corrections)
+
+
+def test_merge_item_discount_and_summary_row_not_double_counted():
+    """마트형: 품목별 할인은 item.discount 로, 합계부 요약줄은 버린다."""
+    import server
+    from corrector import KoreanCorrector
+
+    if server._corrector is None:
+        server._corrector = KoreanCorrector()
+    ocr_lines = _HEADER + [
+        _line("미니꿀약과", 100, 150),
+        _line("2,500", 600, 150),
+        _line("$특매할인", 130, 200),
+        _line("-1,510", 600, 200),
+        _line("콘칩", 100, 250),
+        _line("1,000", 600, 250),
+        _line("할인금액", 100, 300),
+        _line("-1,510", 600, 300),
+        _line("합계", 100, 350),
+        _line("1,990", 600, 350),
+    ]
+    parsed = {
+        "items": [
+            {"name": "미니꿀약과", "quantity": 1, "price": 2500, "sub_items": []},
+            {"name": "콘칩", "quantity": 1, "price": 1000, "sub_items": []},
+        ],
+        "total_amount": 1990,
+    }
+    merged, _ = server._merge(parsed, ocr_lines)
+    assert [(i["name"], i["price"], i["discount"]) for i in merged["items"]] == [
+        ("미니꿀약과", 2500, 1510),
+        ("콘칩", 1000, 0),
+    ]
+    assert merged["discount"] == 0
+    assert merged["total_verified"] is True
+
+
+def test_merge_receipt_discount_fixes_total_from_subtotal():
+    """배달앱형: VLM 이 소계를 합계로 착각해도 전체 할인을 알면 라벨 합계를 채택한다."""
+    import server
+    from corrector import KoreanCorrector
+
+    if server._corrector is None:
+        server._corrector = KoreanCorrector()
+    ocr_lines = _HEADER + [
+        _line("파스타", 100, 150),
+        _line("12,900", 600, 150),
+        _line("소계금액", 100, 200),
+        _line("16,000", 600, 200),
+        _line("할인금액", 100, 250),
+        _line("3,000", 600, 250),
+        _line("합계금액", 100, 300),
+        _line("9,900", 600, 300),
+    ]
+    parsed = {
+        "items": [{"name": "파스타", "quantity": 1, "price": 12900, "sub_items": []}],
+        "total_amount": 16000,
+    }
+    merged, corrections = server._merge(parsed, ocr_lines)
+    assert merged["discount"] == 3000
+    assert merged["items"][0]["discount"] == 0
+    assert merged["total_amount"] == 9900  # 12,900 - 3,000
+    assert merged["total_verified"] is True
+    assert "ocr_layout" in [c["reason"] for c in corrections]
+
+
+def test_merge_without_discount_keeps_previous_behaviour():
+    """할인이 없는 영수증은 discount 가 0이고 기존 검증이 그대로 동작한다."""
+    import server
+    from corrector import KoreanCorrector
+
+    if server._corrector is None:
+        server._corrector = KoreanCorrector()
+    ocr_lines = _HEADER + [
+        _line("신라면큰사발", 100, 150),
+        _line("1,600", 600, 150),
+        _line("포장봉투", 100, 200),
+        _line("100", 600, 200),
+        _line("합계", 100, 250),
+        _line("1,700", 600, 250),
+    ]
+    parsed = {
+        "items": [
+            {"name": "신라면큰사발", "quantity": 1, "price": 1600, "sub_items": []},
+            {"name": "포장봉투", "quantity": 1, "price": 100, "sub_items": []},
+        ],
+        "total_amount": 1700,
+    }
+    merged, _ = server._merge(parsed, ocr_lines)
+    assert merged["discount"] == 0
+    assert all(i["discount"] == 0 for i in merged["items"])
+    assert merged["total_verified"] is True

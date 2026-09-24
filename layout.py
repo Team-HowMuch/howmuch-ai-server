@@ -46,6 +46,20 @@ _LABEL_NAME = re.compile(
     r"|합계|소계|총액|총구매|과세물품|면세물품|가액"
 )
 
+# 할인 어휘. 63장 실측에서 나온 것만 담았다.
+# `에누리`가 `할인`만큼 자주 나오고, 홈푸드마트는 `$특매할인`, 신세계는 `직원 에누리20%`처럼 쓴다.
+_DISCOUNT_WORD = re.compile(r"할인|에누리|쿠폰|특매|D/?C")
+
+# 합계부의 할인 "요약" 라벨. 품목별 할인 줄들의 합계를 다시 적은 것이라 또 빼면 이중차감이다.
+# 실측: `할인금액 : -1,510`(홈푸드마트), `총할인액 -12,000`·`쿠폰할인 -12,000`(하나로마트),
+# `할인(에누리) -23,980`(홈플러스), `에누리계 -22,240`(신세계)
+_DISCOUNT_TOTAL_LABEL = re.compile(r"할인금액|총할인|할인계|할인액|에누리계|할인\(에누리\)|쿠폰할인")
+
+# 할인처럼 보이지만 할인이 아닌 줄.
+# `할인: 0, 현재잔액: 5,000` 은 농·축산물 할인지원금 한도 안내이고,
+# `배달팁 할인` 은 배달팁 순액 안에서 이미 상계된 값이라 총 할인에 더하면 이중계상이다.
+_DISCOUNT_DECOY = re.compile(r"현재잔액|잔액|배달팁할인|배달팁|바코드|이용권")
+
 # 하위 옵션 접두 기호
 _SUB_PREFIX = re.compile(r"^[-*+└ㄴ>›»▶►▸~]|^\(추가|^옵션")
 
@@ -102,6 +116,8 @@ class LayoutItem:
     price: int | None
     sub_items: list[LayoutSubItem] = field(default_factory=list)
     name_confidence: float = 1.0
+    #: 이 품목 줄에 귀속되는 할인액. 항상 0 이상이고, price 는 할인 **전** 금액이다.
+    discount: int = 0
 
 
 @dataclass
@@ -109,6 +125,8 @@ class Layout:
     rows: list[Row]
     items: list[LayoutItem]
     total_amount: int | None
+    #: 특정 품목에 귀속되지 않는 영수증 전체 단위 할인액. 항상 0 이상.
+    discount: int = 0
 
 
 def _to_tokens(ocr_lines: list[dict]) -> list[Token]:
@@ -213,6 +231,23 @@ def _char_width(tokens: list[Token]) -> float:
     return median(widths) if widths else 1.0
 
 
+def _discount_kind(name: str | None, price: int | None) -> str | None:
+    """할인 줄이면 종류를, 아니면 None을 돌려준다.
+
+    반환값은 "item"(품목에 귀속) 또는 "total"(영수증 전체 요약)이다.
+
+    금액이 0이면 할인이 아니다. `할인: 0`, `할  인  0`, `배달팁 할인 0` 처럼 값이 0인
+    자리표시자가 실측 63장 중 여러 장에 있었다. 부호는 보지 않는다. 배달앱과 백화점은
+    할인을 부호 없는 양수로 찍는다(`할인금액 3,000`, `할인금액 27,800`).
+    """
+    if not name or not price:
+        return None
+    compact = re.sub(r"\s+", "", name)
+    if not _DISCOUNT_WORD.search(compact) or _DISCOUNT_DECOY.search(compact):
+        return None
+    return "total" if _DISCOUNT_TOTAL_LABEL.search(compact) else "item"
+
+
 def analyze_receipt(ocr_lines: list[dict]) -> Layout:
     tokens = _to_tokens(ocr_lines)
     rows = group_rows(tokens)
@@ -228,6 +263,7 @@ def analyze_receipt(ocr_lines: list[dict]) -> Layout:
 
     items: list[LayoutItem] = []
     pending: dict | None = None  # 가격 없는 품목명 줄 (다음 가격 줄을 기다림)
+    summary_discount = 0  # 합계부 할인 요약줄의 값 (품목별 합과 대조해 이중계상을 막는다)
 
     for row in region:
         parsed = _parse_row(row)
@@ -235,11 +271,26 @@ def analyze_receipt(ocr_lines: list[dict]) -> Layout:
         compact_name = re.sub(r"\s+", "", name) if name else ""
         if compact_name and (_LABEL_NAME.search(compact_name) or _TOTAL_LABEL.search(compact_name)):
             continue  # 요약/전표/합계 라벨 줄은 품목도 pending도 아니다
+
+        # 할인 줄은 하위 옵션이 아니라 discount 로 뺀다. 예전에는 음수 금액이라는 이유로
+        # sub_items 에 들어갔는데, 그러면 합계부 요약줄(`할인금액 -1,510`)까지 직전 품목의
+        # 옵션이 되어 품목 합에서 할인이 두 번 빠졌다.
+        kind = _discount_kind(name, price)
+        if kind == "total":
+            summary_discount += abs(price)
+            continue
+        if kind == "item":
+            if items:
+                items[-1].discount += abs(price)
+            else:
+                summary_discount += abs(price)  # 귀속할 품목이 없으면 전체 할인으로 본다
+            continue
+
         indent = (row.x1 - base_x) / char_w if char_w else 0.0
         is_sub = name is not None and (
             bool(_SUB_PREFIX.match(name))
             or indent >= 1.5
-            or (price is not None and price < 0)  # 행사할인 등 음수 금액 줄
+            or (price is not None and price < 0)  # 할인 어휘가 없는 음수 줄
         )
 
         if is_sub:
@@ -274,6 +325,19 @@ def analyze_receipt(ocr_lines: list[dict]) -> Layout:
             # 직전 품목명 줄이 없으면 이름 없는 가격 줄이므로 버린다
         # 이름도 가격도 없는 줄(바코드 조각 등)은 무시
 
+    # 품목 영역 밖의 할인 요약줄도 줍는다. 배달앱은 할인을 품목 영역이 끝난 뒤
+    # (`소계금액` 다음) 부호 없는 양수로 찍어서 영역 안에서는 보이지 않는다.
+    for row in rows[end:]:
+        parsed = _parse_row(row)
+        if _discount_kind(parsed["name"], parsed["price"]) is not None:
+            summary_discount += abs(parsed["price"])
+
+    # 요약값이 품목별 할인 합과 같으면 같은 돈을 두 번 적은 것이므로 버린다.
+    # 다르면 요약이 더 큰 만큼만 전체 단위 할인으로 본다. 신세계처럼 요약줄이 품목별
+    # 할인 중 일부만 집계하는 영수증이 있어, 요약값을 그대로 믿으면 오히려 줄어든다.
+    item_discount_sum = sum(i.discount for i in items)
+    receipt_discount = max(0, summary_discount - item_discount_sum)
+
     total = None
     weak_total = None
     for row in rows:
@@ -289,4 +353,4 @@ def analyze_receipt(ocr_lines: list[dict]) -> Layout:
                 weak_total = value
     if total is None:
         total = weak_total
-    return Layout(rows=rows, items=items, total_amount=total)
+    return Layout(rows=rows, items=items, total_amount=total, discount=receipt_discount)
