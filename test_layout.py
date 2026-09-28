@@ -374,13 +374,17 @@ def test_merge_baemin_receipt_structure_reconciliation():
     merged, corrections = server._merge(parsed, ocr_lines)
 
     by_name = {it["name"]: it for it in merged["items"]}
-    assert set(by_name) == {"치즈스틱", "데리세트", "토네이도쿠키", "통다리매운셋", "배달팁"}
+    # 배달팁은 품목이 아니라 delivery_fee 로 간다
+    assert set(by_name) == {"치즈스틱", "데리세트", "토네이도쿠키", "통다리매운셋"}
+    assert merged["delivery_fee"] == 2700
     assert [s["name"] for s in by_name["데리세트"]["sub_items"]] == ["선택양념치즈"]
     assert [(s["name"], s["price"]) for s in by_name["통다리매운셋"]["sub_items"]] == [
         ("L포테이토", 500)
     ]
     assert by_name["토네이도쿠키"]["sub_items"] == []
-    # 3800+7700+600+4200+10300+500+2700 = 29,800 == 결제금액 라벨 (받을금액 0은 무시)
+    # 품목 3800+7700+600+4200+10300+500 = 27,100, 여기에 배달비 2,700 을 더해
+    # 29,800 == 결제금액 라벨 (받을금액 0은 무시). 배달비를 검증식에 넣지 않으면
+    # 27,100 이 되어 과세물품가액과 헷갈린다.
     assert merged["total_amount"] == 29800
     assert merged["total_verified"] is True
     reasons = {c["reason"] for c in corrections}
@@ -480,7 +484,8 @@ def test_merge_wrapped_menu_name_and_placeholder_scrub():
     merged, corrections = server._merge(parsed, ocr_lines)
 
     names = [it["name"] for it in merged["items"]]
-    assert names == ["갓 튀긴 옛날통닭 + 콜라 + 치킨 무 [한그릇 세트]", "배달비"]
+    assert names == ["갓 튀긴 옛날통닭 + 콜라 + 치킨 무 [한그릇 세트]"]  # 배달비는 품목이 아니다
+    assert merged["delivery_fee"] == 0
     assert [(s["name"], s["price"]) for s in merged["items"][0]["sub_items"]] == [
         ("치킨 무 + 콜라 500ml", 0),
         ("양념소스 추가", 500),
@@ -725,3 +730,646 @@ def test_merge_summary_label_subitem_is_not_charged_to_the_item():
     ]
     assert merged["discount"] == 0  # 요약줄이 말하는 520 은 이미 품목에 있다
     assert all(i["sub_items"] == [] for i in merged["items"])
+
+
+# ---------------------------------------------------------------- 배달비
+
+def _merge_with(parsed, ocr_lines):
+    import server
+    from corrector import KoreanCorrector
+
+    if server._corrector is None:
+        server._corrector = KoreanCorrector()
+    return server._merge(parsed, ocr_lines)
+
+
+def test_delivery_fee_waived_nets_to_zero_and_beats_vlm():
+    """배민 한집배달 실측: `맨드본 배달팁 1,000` 바로 아래 `-1,000`(무료배달).
+
+    VLM 은 1,000 만 옮겨 적어 품목으로 올린다. 좌표가 본 순액 0 이 이겨야 한다.
+    """
+    ocr_lines = _HEADER + [
+        _line("아이스티", 100, 150), _line("3,000", 600, 150),
+        _line("주문금액", 100, 200), _line("3,000", 600, 200),
+        _line("맨드본 배달팁", 100, 250), _line("1,000", 600, 250),
+        _line("-1,000", 600, 290),
+        _line("총결제금액", 100, 340), _line("3,000", 600, 340),
+    ]
+    parsed = {
+        "items": [
+            {"name": "아이스티", "quantity": 1, "price": 3000, "sub_items": []},
+            {"name": "배달팁", "quantity": 1, "price": 1000, "sub_items": []},
+        ],
+        "total_amount": 3000,
+    }
+    merged, corrections = _merge_with(parsed, ocr_lines)
+    assert [i["name"] for i in merged["items"]] == ["아이스티"]
+    assert merged["delivery_fee"] == 0
+    assert merged["discount"] == 0  # 무료배달 상계는 영수증 할인이 아니다
+    assert merged["total_verified"] is True
+    assert any(c["reason"] == "delivery_fee_from_item" for c in corrections)
+
+
+def test_delivery_fee_parent_and_breakdown_rows_count_once():
+    """`배달팁 3,000` 아래 `ㄴ기본배달팁 3,000` 내역 — 같은 돈을 두 번 적은 것이다."""
+    from layout import analyze_receipt
+
+    lines = _HEADER + [
+        _line("짬뽕", 100, 150), _line("9,000", 600, 150),
+        _line("주문금액", 100, 200), _line("9,000", 600, 200),
+        _line("배달팁", 100, 250), _line("3,000", 600, 250),
+        _line("ㄴ기본배달팁", 100, 290), _line("3,000", 600, 290),
+        _line("총결제금액", 100, 340), _line("12,000", 600, 340),
+    ]
+    assert analyze_receipt(lines).delivery_fee == 3000
+
+
+def test_delivery_fee_unreadable_parent_falls_back_to_breakdown():
+    """상위 줄 금액이 `3.000` 으로 깨져 못 읽으면 내역 줄을 쓴다. 깨진 줄 때문에 죽지도 않는다."""
+    from layout import analyze_receipt
+
+    lines = _HEADER + [
+        _line("짬뽕", 100, 150), _line("9,000", 600, 150),
+        _line("주문금액", 100, 200), _line("9,000", 600, 200),
+        _line("배달팁", 100, 250), _line("3.000", 600, 250),
+        _line("ㄴ기본배달팁", 100, 290), _line("3,000", 600, 290),
+    ]
+    assert analyze_receipt(lines).delivery_fee == 3000
+
+
+def test_delivery_fee_with_garbled_waiver_does_not_go_negative():
+    """실측(1790229097208): `기본배달팁 4.100` / `-4.100` 둘 다 구분자가 깨졌다.
+
+    배달비 줄을 못 읽었으면 "봤다"고 치지 않는다(None). 음수 상계만 남아 음수 배달비가
+    되면 안 되고, 0 으로 단정해서도 안 된다 — 0 이면 VLM 이 제대로 읽은 배달비를 버린다.
+    이 영수증은 VLM 도 배달비를 올리지 않아 최종값은 0 이다.
+    """
+    from layout import analyze_receipt
+
+    lines = _HEADER + [
+        _line("순살해장국", 100, 150), _line("12,500", 600, 150),
+        _line("주문금액", 100, 200), _line("12,500", 600, 200),
+        _line("기본배달팁", 100, 250), _line("4.100", 600, 250),
+        _line("-4,100", 600, 290),
+    ]
+    assert analyze_receipt(lines).delivery_fee is None
+    parsed = {"items": [{"name": "순살해장국", "quantity": 1, "price": 12500, "sub_items": []}],
+              "total_amount": 12500}
+    merged, _ = _merge_with(parsed, lines)
+    assert merged["delivery_fee"] == 0
+
+
+def test_delivery_fee_discount_row_is_netted_not_counted_as_discount():
+    """`배달팁 할인 1,000` 이 부호 없이 찍혀도 배달비에서 빼고, 영수증 할인에는 넣지 않는다."""
+    ocr_lines = _HEADER + [
+        _line("짬뽕", 100, 150), _line("9,000", 600, 150),
+        _line("주문금액", 100, 200), _line("9,000", 600, 200),
+        _line("배달팁", 100, 250), _line("3,000", 600, 250),
+        _line("배달팁 할인", 100, 300), _line("1,000", 600, 300),
+        _line("총결제금액", 100, 350), _line("11,000", 600, 350),
+    ]
+    parsed = {
+        "items": [{"name": "짬뽕", "quantity": 1, "price": 9000, "sub_items": []}],
+        "total_amount": 11000,
+    }
+    merged, _ = _merge_with(parsed, ocr_lines)
+    assert merged["delivery_fee"] == 2000
+    assert merged["discount"] == 0
+    assert merged["total_verified"] is True
+
+
+def test_delivery_fee_from_vlm_sub_item_when_layout_saw_none():
+    """좌표가 배달비 줄을 못 봤으면(오독 등) VLM 이 옵션으로 붙인 배달비를 쓴다."""
+    ocr_lines = [_line("배민배달선결제", 100, 100), _line("14,000", 600, 100)]
+    parsed = {
+        "items": [
+            {
+                "name": "치킨 반마리",
+                "quantity": 1,
+                "price": 12000,
+                "sub_items": [{"name": "배달비", "price": 2000}],
+            }
+        ],
+        "total_amount": 14000,
+    }
+    merged, _ = _merge_with(parsed, ocr_lines)
+    assert merged["items"][0]["sub_items"] == []
+    assert merged["delivery_fee"] == 2000
+    assert merged["total_verified"] is True
+
+
+def test_delivery_words_that_are_not_fees():
+    """`배달주소`·`배달메모`·`한집배달`·`배민배달선결제 32,400` 은 배달비가 아니다."""
+    from layout import analyze_receipt
+
+    lines = [
+        _line("한집배달 주문전표", 100, 50),
+        _line("배달주소: 대구 달성군", 100, 80),
+        _line("배달메모: 문 앞에 두세요", 100, 110),
+    ] + _HEADER[:0] + [
+        _line("상품명", 100, 140), _line("수량", 400, 142), _line("금액", 600, 138),
+        _line("짬뽕", 100, 190), _line("9,000", 600, 190),
+        _line("배민배달선결제", 100, 240), _line("32,400", 600, 240),
+    ]
+    layout = analyze_receipt(lines)
+    assert layout.delivery_fee is None
+    assert [i.name for i in layout.items] == ["짬뽕"]
+
+
+def test_delivery_fee_row_inside_item_region_is_not_recovered_as_item():
+    """품목 영역 안의 `배달팁 3,000` 을 좌표 복구가 품목으로 되살리면 합계에서 두 번 더해진다."""
+    ocr_lines = _HEADER + [
+        _line("짬뽕", 100, 150), _line("9,000", 600, 150),
+        _line("배달팁", 100, 200), _line("3,000", 600, 200),
+        _line("합계", 100, 250), _line("12,000", 600, 250),
+    ]
+    parsed = {
+        "items": [{"name": "짬뽕", "quantity": 1, "price": 9000, "sub_items": []}],
+        "total_amount": 12000,
+    }
+    merged, corrections = _merge_with(parsed, ocr_lines)
+    assert [i["name"] for i in merged["items"]] == ["짬뽕"]
+    assert not any(c["reason"] == "ocr_recovered" for c in corrections)
+    assert merged["delivery_fee"] == 3000
+    assert merged["total_verified"] is True
+
+
+def test_delivery_fee_ignores_following_nameless_positive_row():
+    """배달비 줄 다음에 이름 없는 양수 줄(줄바꿈된 합계 값)이 오면 더하지 않는다.
+
+    실측 전표에서 `총결제금액` 라벨과 값이 다른 줄로 갈라지는 일이 흔하다
+    (20260924_144101 의 `15,200` 단독 줄). 더하면 배달비가 합계만큼 부풀어 오른다.
+    """
+    from layout import analyze_receipt
+
+    lines = _HEADER + [
+        _line("짬뽕", 100, 150), _line("9,000", 600, 150),
+        _line("주문금액", 100, 200), _line("9,000", 600, 200),
+        _line("배달팁", 100, 250), _line("3,000", 600, 250),
+        _line("12,000", 600, 290),
+        _line("총결제금액", 100, 330),
+    ]
+    assert analyze_receipt(lines).delivery_fee == 3000
+
+
+# ---- 독립 리뷰에서 재현된 결함들 (각 테스트는 수정 전 코드에서 실패했다)
+
+def test_delivery_waiver_sent_as_vlm_subs_is_not_charged_as_item_discount():
+    """리뷰 #1a: VLM 이 `ㄴ기본배달팁 4,100` 과 이름 없는 `-4,100` 을 마지막 메뉴 옵션으로 붙인다.
+
+    무료배달 상계가 할인 접기에서 품목 할인이 되면 4,100 이 한 번 더 빠진다.
+    VLM 합계를 일부러 틀리게 줘서, 검증이 라벨 일치가 아니라 항등식 경로를 타게 한다.
+    """
+    ocr_lines = _HEADER + [
+        _line("순살해장국", 100, 150), _line("12,500", 600, 150),
+        _line("주문금액", 100, 200), _line("12,500", 600, 200),
+        _line("배달팁", 100, 240), _line("4,100", 600, 240),
+        _line("-4,100", 600, 280),
+        _line("총결제금액", 100, 330), _line("12,500", 600, 330),
+    ]
+    parsed = {
+        "items": [{
+            "name": "순살해장국", "quantity": 1, "price": 12500,
+            "sub_items": [{"name": "ㄴ기본배달팁", "price": 4100}, {"name": None, "price": -4100}],
+        }],
+        "total_amount": 16600,  # VLM 이 배달팁을 더해 틀림
+    }
+    merged, corrections = _merge_with(parsed, ocr_lines)
+    item = merged["items"][0]
+    assert (item["discount"], item["sub_items"]) == (0, [])
+    assert merged["delivery_fee"] == 0
+    assert merged["total_amount"] == 12500
+    assert merged["total_verified"] is True
+    assert any(c["reason"] == "ocr_layout" for c in corrections)  # 항등식 경로로 검증됐다
+
+
+def test_delivery_discount_sent_as_vlm_sub_goes_to_fee_not_item():
+    """리뷰 #1b: `배달팁 할인 -1,000` 이 옵션으로 오면 배달비에서 빼고, 품목 할인이 아니다."""
+    ocr_lines = [_line("배민배달선결제", 100, 100), _line("14,500", 600, 100)]
+    parsed = {
+        "items": [{
+            "name": "순살해장국", "quantity": 1, "price": 12500,
+            "sub_items": [{"name": "배달팁", "price": 3000}, {"name": "배달팁 할인", "price": -1000}],
+        }],
+        "total_amount": 14500,
+    }
+    merged, _ = _merge_with(parsed, ocr_lines)
+    assert merged["items"][0]["discount"] == 0
+    assert merged["delivery_fee"] == 2000
+    assert server_identity(merged) == 14500
+
+
+def server_identity(merged):
+    import server
+    return server._items_sum(merged["items"]) - merged["discount"] + merged["delivery_fee"]
+
+
+def test_delivery_label_and_value_on_split_rows():
+    """리뷰 #2a: 라벨과 값이 y 로 갈라져 다른 행이 된다. 바로 아래 이름 없는 값을 쓴다."""
+    from layout import analyze_receipt
+
+    lines = _HEADER + [
+        _line("짬뽕", 100, 150), _line("9,000", 600, 150),
+        _line("주문금액", 100, 200), _line("9,000", 600, 200),
+        _line("배달팁", 100, 250),
+        _line("3,000", 600, 285),
+        _line("총결제금액", 100, 330), _line("12,000", 600, 330),
+    ]
+    assert analyze_receipt(lines).delivery_fee == 3000
+
+
+def test_unreadable_fee_row_falls_back_to_vlm_value():
+    """리뷰 #2b: `배달팁 3.000` 을 못 읽었다고 0 으로 단정하면 VLM 의 3,000 을 버리게 된다."""
+    ocr_lines = _HEADER + [
+        _line("짬뽕", 100, 150), _line("9,000", 600, 150),
+        _line("주문금액", 100, 200), _line("9,000", 600, 200),
+        _line("배달팁", 100, 250), _line("3.000", 600, 250),
+        _line("총결제금액", 100, 330), _line("12,000", 600, 330),
+    ]
+    parsed = {
+        "items": [
+            {"name": "짬뽕", "quantity": 1, "price": 9000, "sub_items": []},
+            {"name": "배달팁", "quantity": 1, "price": 3000, "sub_items": []},
+        ],
+        "total_amount": 12000,
+    }
+    merged, _ = _merge_with(parsed, ocr_lines)
+    assert merged["delivery_fee"] == 3000
+    assert server_identity(merged) == 12000
+
+
+def test_delivery_notice_is_not_a_fee_row():
+    """리뷰 #2c: `배달 비대면` 은 공백을 지우면 `배달비대면` — 배달비가 아니다.
+
+    VLM 이 요청사항을 금액 0 옵션으로 올려도 옵션으로 남아야 하고, 좌표에서 금액이 붙은
+    안내 줄(`배달 비대면 할인 1,000원` 같은 이벤트 문구)도 배달비로 읽으면 안 된다.
+    (2차 리뷰: 금액 없는 줄만 넣으면 이름 판정 없이도 통과해 아무것도 검증하지 않았다.)
+    """
+    from layout import analyze_receipt, delivery_fee_label
+
+    assert delivery_fee_label("배달 비대면 요청") is None
+    lines = _HEADER + [
+        _line("짬뽕", 100, 150), _line("9,000", 600, 150),
+        _line("배달 비대면 요청 시", 100, 200), _line("1,000", 600, 200),
+    ]
+    assert analyze_receipt(lines).delivery_fee is None
+    parsed = {
+        "items": [{"name": "짬뽕", "quantity": 1, "price": 9000,
+                   "sub_items": [{"name": "배달 비대면 요청", "price": 0}]}],
+        "total_amount": 9000,
+    }
+    merged, _ = _merge_with(parsed, [])
+    assert [s["name"] for s in merged["items"][0]["sub_items"]] == ["배달 비대면 요청"]
+
+
+def test_breakdown_row_without_leading_marker_is_not_a_parent():
+    """리뷰 #3: OCR 이 `ㄴ` 을 따로 떼거나 `L`·`A` 로 읽거나 떨어뜨려도 내역 줄은 내역 줄이다."""
+    from layout import analyze_receipt
+
+    for child in (["ㄴ", "기본배달팁"], ["L기본배달팁"], ["A", "기본배달팁"], ["기본배달팁"]):
+        lines = _HEADER + [
+            _line("짬뽕", 100, 150), _line("9,000", 600, 150),
+            _line("주문금액", 100, 200), _line("9,000", 600, 200),
+            _line("배달팁", 100, 250), _line("3,000", 600, 250),
+        ]
+        x = 100
+        for text in child:
+            lines.append(_line(text, x, 290))
+            x += 20 * len(text) + 10
+        lines.append(_line("3,000", 600, 290))
+        assert analyze_receipt(lines).delivery_fee == 3000, child
+
+
+def test_shipping_words_inside_product_names_are_not_fees():
+    """리뷰 #4: 온라인 쇼핑 영수증의 상품명 안 `배송비` 는 배달비가 아니다."""
+    ocr_lines = [_line("결제금액", 100, 100), _line("44,900", 600, 100)]
+    parsed = {
+        "items": [
+            {"name": "[배송비무료] 제주감귤 5kg", "quantity": 1, "price": 19900, "sub_items": []},
+            {"name": "사과 1박스(배송비포함)", "quantity": 1, "price": 25000, "sub_items": []},
+        ],
+        "total_amount": 44900,
+    }
+    merged, _ = _merge_with(parsed, ocr_lines)
+    assert [i["name"] for i in merged["items"]] == ["[배송비무료] 제주감귤 5kg", "사과 1박스(배송비포함)"]
+    assert merged["delivery_fee"] == 0
+    assert server_identity(merged) == 44900
+
+
+def test_missed_item_with_same_price_as_fee_is_still_recovered():
+    """리뷰 #5: VLM 이 `군만두 3,000` 을 놓치고 `배달팁 3,000` 을 품목으로 올렸다.
+
+    배달비를 늦게 떼면 좌표 복구가 군만두를 금액이 같은 배달팁 품목과 짝지어 되살리지 않는다.
+    """
+    ocr_lines = _HEADER + [
+        _line("짬뽕", 100, 150), _line("9,000", 600, 150),
+        _line("군만두", 100, 200), _line("3,000", 600, 200),
+        _line("주문금액", 100, 250), _line("12,000", 600, 250),
+        _line("배달팁", 100, 300), _line("3,000", 600, 300),
+        _line("총결제금액", 100, 350), _line("15,000", 600, 350),
+    ]
+    parsed = {
+        "items": [
+            {"name": "짬뽕", "quantity": 1, "price": 9000, "sub_items": []},
+            {"name": "배달팁", "quantity": 1, "price": 3000, "sub_items": []},
+        ],
+        "total_amount": 15000,
+    }
+    merged, _ = _merge_with(parsed, ocr_lines)
+    assert [i["name"] for i in merged["items"]] == ["짬뽕", "군만두"]
+    assert merged["delivery_fee"] == 3000
+    assert server_identity(merged) == 15000
+
+
+def test_string_price_on_fee_item_does_not_crash():
+    """리뷰 #6: VLM 이 금액을 `"3,000"` 문자열로 주면 500 으로 죽었다."""
+    parsed = {
+        "items": [
+            {"name": "짬뽕", "quantity": 1, "price": 9000, "sub_items": []},
+            {"name": "배달비", "quantity": 1, "price": "3,000", "sub_items": []},
+        ],
+        "total_amount": 12000,
+    }
+    merged, _ = _merge_with(parsed, [])
+    assert merged["delivery_fee"] == 3000
+
+
+def test_free_delivery_rows_without_fee_word_are_netted():
+    """리뷰 #7: `무료배달 -3,000`, `와우 무료배달 -3,000`, `무료배달 할인 -3,000` 은 배달비 상계다.
+
+    영수증 할인으로 세지도 않는다(순액 배달비라는 계약).
+    """
+    for label in ("무료배달", "와우 무료배달", "무료배달 할인"):
+        ocr_lines = _HEADER + [
+            _line("짬뽕", 100, 150), _line("9,000", 600, 150),
+            _line("주문금액", 100, 200), _line("9,000", 600, 200),
+            _line("배달비", 100, 250), _line("3,000", 600, 250),
+            _line(label, 100, 290), _line("-3,000", 600, 290),
+            _line("총결제금액", 100, 340), _line("9,000", 600, 340),
+        ]
+        parsed = {"items": [{"name": "짬뽕", "quantity": 1, "price": 9000, "sub_items": []}],
+                  "total_amount": 9000}
+        merged, _ = _merge_with(parsed, ocr_lines)
+        assert (merged["delivery_fee"], merged["discount"]) == (0, 0), label
+        assert server_identity(merged) == 9000, label
+
+
+def test_merged_fee_and_option_row_is_not_trusted():
+    """리뷰 #8 (실측 20260924_144401 모양): `03.배달비 --케이준양념감자(중) 3,000 2,000`.
+
+    두 줄이 한 행으로 합쳐지면 최우측 금액이 배달비라는 보장이 없다. 좌표는 포기하고 VLM 값을 쓴다.
+    """
+    ocr_lines = _HEADER + [
+        _line("후라이드", 100, 150), _line("15,000", 600, 150),
+        _line("03.배달비", 100, 250), _line("3,000", 600, 250),
+        _line("--케이준양념감자(중)", 300, 262), _line("2,000", 650, 262),
+        _line("총결제금액", 100, 340), _line("20,000", 600, 340),
+    ]
+    parsed = {
+        "items": [
+            {"name": "후라이드", "quantity": 1, "price": 15000,
+             "sub_items": [{"name": "케이준양념감자(중)", "price": 2000}]},
+            {"name": "배달비", "quantity": 1, "price": 3000, "sub_items": []},
+        ],
+        "total_amount": 20000,
+    }
+    merged, _ = _merge_with(parsed, ocr_lines)
+    assert merged["delivery_fee"] == 3000
+    assert server_identity(merged) == 20000
+
+
+def test_wrapped_name_merge_does_not_swallow_item_into_fee():
+    """리뷰 #9: 금액 0 + 옵션 품목이 이름 병합으로 배달팁에 붙었다가 배달팁과 같이 버려졌다."""
+    parsed = {
+        "items": [
+            {"name": "짬뽕", "quantity": 1, "price": 9000, "sub_items": []},
+            {"name": "배달팁", "quantity": 1, "price": 3000, "sub_items": []},
+            {"name": "음료 서비스", "quantity": 1, "price": 0,
+             "sub_items": [{"name": "콜라 1.25L", "price": 2000}]},
+        ],
+        "total_amount": 14000,
+    }
+    merged, _ = _merge_with(parsed, [])
+    assert merged["delivery_fee"] == 3000
+    assert server_identity(merged) == 14000
+
+
+def test_merged_row_ending_in_fee_label_with_two_amounts_is_not_trusted():
+    """합쳐진 행의 반대 순서: 옵션이 왼쪽, 배달비가 오른쪽이면 이름이 `...배달비` 로 끝난다.
+
+    이름 끝 판정은 통과하지만 금액이 둘(2,000·3,000)이라 어느 쪽이 배달비인지 모른다.
+    """
+    from layout import analyze_receipt
+
+    lines = _HEADER + [
+        _line("후라이드", 100, 150), _line("15,000", 600, 150),
+        _line("--케이준양념감자(중)", 100, 250), _line("2,000", 450, 250),
+        _line("03.배달비", 550, 258), _line("3,000", 750, 258),
+    ]
+    assert analyze_receipt(lines).delivery_fee is None
+
+
+# ---- 2차 독립 리뷰에서 재현된 결함들
+
+def test_garbled_fee_value_does_not_borrow_total_below():
+    """2차 #1A: `배달팁 3.000`(깨짐) 아래의 `12,000` 은 다음 라벨 `총결제금액` 의 값이다."""
+    from layout import analyze_receipt
+
+    lines = _HEADER + [
+        _line("짬뽕", 100, 150), _line("9,000", 600, 150),
+        _line("주문금액", 100, 200), _line("9,000", 600, 200),
+        _line("배달팁", 100, 250), _line("3.000", 600, 250),
+        _line("12,000", 600, 290),
+        _line("총결제금액", 100, 330),
+    ]
+    assert analyze_receipt(lines).delivery_fee is None  # VLM 값으로 넘긴다
+
+
+def test_fee_does_not_borrow_subtotal_above():
+    """2차 #1B: 위 줄의 이름 없는 `9,000` 은 앞 요약줄(주문금액)의 값이다. 위는 보지 않는다."""
+    from layout import analyze_receipt
+
+    lines = _HEADER + [
+        _line("짬뽕", 100, 150), _line("9,000", 600, 150),
+        _line("주문금액", 100, 200),
+        _line("9,000", 600, 240),
+        _line("배달팁", 100, 290),
+        _line("총결제금액", 100, 340), _line("12,000", 600, 340),
+    ]
+    assert analyze_receipt(lines).delivery_fee is None
+
+
+def test_split_value_owned_by_next_label_without_digits_is_not_borrowed():
+    """2차 #1: 값 행 다음이 숫자 없는 라벨이면 그 값은 다음 라벨 몫이다."""
+    from layout import analyze_receipt
+
+    lines = _HEADER + [
+        _line("짬뽕", 100, 150), _line("9,000", 600, 150),
+        _line("배달팁", 100, 250),
+        _line("12,000", 600, 285),
+        _line("총결제금액", 100, 320),
+    ]
+    assert analyze_receipt(lines).delivery_fee is None
+
+
+def test_split_value_is_borrowed_once_even_if_next_label_is_garbled():
+    """2차 #3(C): `배달팁` / `3,000` / `배달팁 할인 1.000`(깨짐). 3,000 은 배달팁 값이고,
+    깨진 할인 줄이 그 값을 다시 가져가 0 이 되면 안 된다."""
+    from layout import analyze_receipt
+
+    lines = _HEADER + [
+        _line("짬뽕", 100, 150), _line("9,000", 600, 150),
+        _line("주문금액", 100, 200), _line("9,000", 600, 200),
+        _line("배달팁", 100, 250),
+        _line("3,000", 600, 285),
+        _line("배달팁 할인", 100, 330), _line("1.000", 600, 330),
+        _line("총결제금액", 100, 380), _line("11,000", 600, 380),
+    ]
+    assert analyze_receipt(lines).delivery_fee == 3000
+
+
+def test_pending_item_name_does_not_swallow_fee_value_or_waiver():
+    """2차 #2(D·D2, 1차 수정이 만든 회귀): 가격 없는 품목명 줄(`단무지 많이`) 뒤에
+    배달팁 값 행이나 무료배달 상계 행이 오면, 그 금액이 품목으로 복구되면 안 된다."""
+    for rows, fee in (
+        ([_line("배달팁", 100, 250), _line("3,000", 600, 285)], 3000),
+        ([_line("배달팁", 100, 250), _line("3,000", 600, 250), _line("-3,000", 600, 285)], 0),
+    ):
+        ocr_lines = _HEADER + [
+            _line("짬뽕", 100, 150), _line("9,000", 600, 150),
+            _line("단무지 많이", 100, 200),
+        ] + rows + [_line("합계", 100, 330), _line(f"{9000 + fee:,}", 600, 330)]
+        parsed = {"items": [{"name": "짬뽕", "quantity": 1, "price": 9000, "sub_items": []}],
+                  "total_amount": 9000 + fee}
+        merged, corrections = _merge_with(parsed, ocr_lines)
+        assert [i["name"] for i in merged["items"]] == ["짬뽕"], fee
+        assert merged["delivery_fee"] == fee
+        assert server_identity(merged) == 9000 + fee
+
+
+def test_offset_labels_ending_in_coupon_are_netted():
+    """2차 #4: `배달팁 무료쿠폰`·`배달비 쿠폰`·`배달팁 할인쿠폰`·`배송비할인쿠폰` 도 상계 줄이다."""
+    # `와우 배달팁 쿠폰` 은 배달비 어휘로 시작하지 않아 끝 판정(쿠폰 접미)만으로 잡혀야 한다.
+    for label in ("배달팁 무료쿠폰", "배달비 쿠폰", "배달팁 할인쿠폰", "배송비할인쿠폰", "와우 배달팁 쿠폰"):
+        ocr_lines = _HEADER + [
+            _line("짬뽕", 100, 150), _line("9,000", 600, 150),
+            _line("주문금액", 100, 200), _line("9,000", 600, 200),
+            _line("배달팁", 100, 250), _line("3,000", 600, 250),
+            _line(label, 100, 290), _line("-3,000", 600, 290),
+            _line("총결제금액", 100, 340), _line("9,000", 600, 340),
+        ]
+        parsed = {"items": [{"name": "짬뽕", "quantity": 1, "price": 9000, "sub_items": []}],
+                  "total_amount": 9000}
+        merged, _ = _merge_with(parsed, ocr_lines)
+        assert (merged["delivery_fee"], merged["discount"]) == (0, 0), label
+        assert server_identity(merged) == 9000, label
+
+
+def test_vlm_fee_names_with_extra_text_are_recognised():
+    """2차 #5: VLM 은 `배달팁 3,000원`, `배달팁(거리할증 1,000원 포함)`, `배달팁 기본` 처럼 보낸다."""
+    from layout import delivery_fee_label
+
+    for name in ("배달팁 3,000원", "배달팁(거리할증 1,000원 포함)", "배달팁 기본", "배달팁 - 기본",
+                 "배달비 합계", "배달요금", "배달비:", "배달 팁", "배달팁(기본)", "배달팁 할인"):
+        assert delivery_fee_label(name) is not None, name
+    for name in ("[배송비무료] 제주감귤 5kg", "사과 1박스(배송비포함)", "배달 비대면 요청",
+                 "배달의민족 쿠폰", "한집배달 주문전표", "배민배달선결제", "배달주소: 대구"):
+        assert delivery_fee_label(name) is None, name
+    # 상위·내역·감액
+    assert delivery_fee_label("배달팁") == "parent"
+    assert delivery_fee_label("03.배달비") == "parent"
+    assert delivery_fee_label("배달팁 기본") == "child"
+    assert delivery_fee_label("ㄴ기본배달팁") == "child"
+    assert delivery_fee_label("와우 무료배달") == "off"
+
+    ocr_lines = _HEADER + [
+        _line("짬뽕", 100, 150), _line("9,000", 600, 150),
+        _line("배달팁", 100, 250), _line("3,000", 600, 250),
+        _line("합계", 100, 300), _line("12,000", 600, 300),
+    ]
+    parsed = {
+        "items": [
+            {"name": "짬뽕", "quantity": 1, "price": 9000, "sub_items": []},
+            {"name": "배달팁 3,000원", "quantity": 1, "price": 3000, "sub_items": []},
+        ],
+        "total_amount": 12000,
+    }
+    merged, _ = _merge_with(parsed, ocr_lines)
+    assert [i["name"] for i in merged["items"]] == ["짬뽕"]
+    assert server_identity(merged) == 12000
+
+
+def test_waiver_at_other_nesting_level_is_matched_by_amount():
+    """2차 #6(H): 배달비는 옵션, 상계 `-4,100` 은 이름 없는 최상위 품목으로 왔다."""
+    parsed = {
+        "items": [
+            {"name": "짬뽕", "quantity": 1, "price": 9000,
+             "sub_items": [{"name": "기본배달팁", "price": 4100}]},
+            {"name": None, "quantity": 1, "price": -4100, "sub_items": []},
+        ],
+        "total_amount": 9000,
+    }
+    merged, _ = _merge_with(parsed, [])
+    assert [i["name"] for i in merged["items"]] == ["짬뽕"]
+    assert merged["delivery_fee"] == 0
+    assert server_identity(merged) == 9000
+
+
+def test_vlm_fee_reported_twice_counts_once():
+    """2차 #7(I): VLM 이 `배달팁 3,000` 을 품목과 옵션 양쪽에 올렸다(좌표는 못 읽음)."""
+    parsed = {
+        "items": [
+            {"name": "짬뽕", "quantity": 1, "price": 9000,
+             "sub_items": [{"name": "배달팁", "price": 3000}]},
+            {"name": "배달팁", "quantity": 1, "price": 3000, "sub_items": []},
+        ],
+        "total_amount": 12000,
+    }
+    merged, _ = _merge_with(parsed, [])
+    assert merged["delivery_fee"] == 3000
+    assert server_identity(merged) == 12000
+
+
+def test_same_parent_fee_printed_twice_counts_once():
+    """2차 #8(L): 같은 `배달팁 3,000` 이 두 군데 찍혔다."""
+    from layout import analyze_receipt
+
+    lines = _HEADER + [
+        _line("짬뽕", 100, 150), _line("9,000", 600, 150),
+        _line("배달팁", 100, 200), _line("3,000", 600, 200),
+        _line("주문금액", 100, 250), _line("9,000", 600, 250),
+        _line("배달팁", 100, 300), _line("3,000", 600, 300),
+    ]
+    assert analyze_receipt(lines).delivery_fee == 3000
+
+
+def test_garbled_fee_value_does_not_borrow_nameless_row_below():
+    """2차 #1: 라벨 줄에 숫자가 있는데 깨졌으면(`3.000`) 아래 값은 남의 것이라 빌리지 않는다.
+
+    다음 줄이 라벨이 아니어도(영수증 끝) 마찬가지다.
+    """
+    from layout import analyze_receipt
+
+    lines = _HEADER + [
+        _line("짬뽕", 100, 150), _line("9,000", 600, 150),
+        _line("배달팁", 100, 250), _line("3.000", 600, 250),
+        _line("12,000", 600, 290),
+    ]
+    assert analyze_receipt(lines).delivery_fee is None
+
+
+def test_partial_waiver_in_same_list_is_netted_not_item_discount():
+    """VLM 옵션 [배달팁 3,000, (이름 없음) -1,000]: 부분 상계라 금액으로는 짝이 안 맞는다.
+
+    바로 뒤따르는 이름 없는 음수라서 배달비 상계로 떼야 한다. 안 떼면 할인 접기가
+    품목 할인으로 만들어 -1,000 이 품목에서 빠진다.
+    """
+    parsed = {
+        "items": [{"name": "짬뽕", "quantity": 1, "price": 9000,
+                   "sub_items": [{"name": "배달팁", "price": 3000}, {"name": None, "price": -1000}]}],
+        "total_amount": 11000,
+    }
+    merged, _ = _merge_with(parsed, [])
+    assert merged["items"][0]["discount"] == 0
+    assert merged["delivery_fee"] == 2000
+    assert server_identity(merged) == 11000

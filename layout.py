@@ -61,7 +61,60 @@ _DISCOUNT_TOTAL_LABEL = re.compile(r"할인금액|합인금액|총할인|할인�
 # 할인처럼 보이지만 할인이 아닌 줄.
 # `할인: 0, 현재잔액: 5,000` 은 농·축산물 할인지원금 한도 안내이고,
 # `배달팁 할인` 은 배달팁 순액 안에서 이미 상계된 값이라 총 할인에 더하면 이중계상이다.
-_DISCOUNT_DECOY = re.compile(r"현재잔액|잔액|배달팁할인|배달팁|바코드|이용권")
+# 배달비 줄의 할인(`배달팁 할인`, `배달비 할인`)은 delivery_fee 에서 상계하므로 여기서 또 세지 않는다.
+_DISCOUNT_DECOY = re.compile(r"현재잔액|잔액|배달팁|배달비|배달료|배달요금|배송비|무료배달|바코드|이용권")
+
+# 배달비 라벨 판정. 두 가지 모양을 인정한다(공백 제거 후).
+#
+# 1) 이름이 배달비 어휘로 **끝난다**: `03.배달비`, `ㄴ기본배달팁`, `맨드본 배달팁`(실측),
+#    `배달팁 할인쿠폰`, `와우 무료배달`, `배달팁(기본)`, `배달비:`.
+# 2) 이름이 배달비 어휘로 **시작**하고, 뒤에 붙은 한글이 수식어뿐이다: VLM 이 붙여 보내는
+#    `배달팁 3,000원`, `배달팁(거리할증 1,000원 포함)`, `배달팁 기본`, `배달비 합계`.
+#
+# 포함만 되면 잡는 식은 안 된다. 온라인 쇼핑 영수증의 `[배송비무료] 제주감귤`,
+# `사과 1박스(배송비포함)` 은 상품이고, 안내문 `배달 비대면 요청` 은 공백을 지우면
+# `배달비대면요청` 이 된다 — 셋 다 배달비 어휘 뒤에 수식어가 아닌 한글이 남는다.
+# OCR 이 두 줄을 한 행으로 합친 `03.배달비 --케이준양념감자(중)` 도 같은 이유로 걸러진다.
+_FEE_WORD = r"(배달(비|팁|료|요금)|배송비|무료배달)"
+_DELIVERY_FEE_END = re.compile(_FEE_WORD + r"(할인|무료|쿠폰)*(\([^)]{0,12}\))?[:：]?$")
+_DELIVERY_FEE_START = re.compile("^" + _FEE_WORD)
+_FEE_QUALIFIER = re.compile(r"기본|합계|할증|추가|거리|할인|무료|쿠폰|포함|금액")
+
+# 내역 줄 표시. `기본배달팁`·`배달팁 기본`·`추가배달비` 는 상위 `배달팁` 의 내역이다.
+# `ㄴ` 기호는 기준으로 못 쓴다. OCR 이 `ㄴ` 을 `L`·`A` 로 읽거나 떨어뜨린다(실측 `A 기본배달팁`).
+_FEE_BREAKDOWN = re.compile(r"기본|할증|추가|거리")
+
+# 배달비를 깎는 줄. `배달팁 할인 1,000`·`무료배달 -3,000` 은 부호와 상관없이 뺀다.
+_DELIVERY_FEE_OFF = re.compile(r"할인|쿠폰|무료")
+
+
+def delivery_fee_label(name) -> str | None:
+    """배달비 줄이면 "parent"(상위)·"child"(내역)·"off"(감액), 아니면 None."""
+    if not isinstance(name, str):
+        return None
+    compact = re.sub(r"\s+", "", name)
+    core = re.sub(r"^[^가-힣]+", "", compact)
+    start = _DELIVERY_FEE_START.match(core)
+    if _DELIVERY_FEE_END.search(compact):
+        pass
+    elif start:
+        rest = re.sub(r"\([^)]*\)", "", core[start.end():])
+        rest = re.sub(r"\d[\d,.]*원?", "", rest)
+        if re.search(r"[가-힣]", _FEE_QUALIFIER.sub("", rest)):
+            return None
+    else:
+        return None
+    if _DELIVERY_FEE_OFF.search(compact):
+        return "off"
+    if start and not _FEE_BREAKDOWN.search(core[start.end():]):
+        return "parent"
+    return "child"
+
+
+# 좌표 복구에서 품목으로 되살리지 않을 줄(넓게 잡는다). 합쳐진 행이 품목으로 복구되면
+# 배달비가 품목과 delivery_fee 양쪽에서 더해진다. 넓게 잡아 생기는 손해는 VLM 이 놓친
+# 배송비 들어간 상품을 좌표로 못 되살리는 것뿐이다.
+_DELIVERY_WORD = re.compile(r"배달(비(?!대면)|팁|료|요금)|배송비|무료배달")
 
 # 하위 옵션 접두 기호
 _SUB_PREFIX = re.compile(r"^[-*+└ㄴ>›»▶►▸~]|^\(추가|^옵션")
@@ -137,6 +190,10 @@ class Layout:
     #: 품목 합과 대조해야 하는데, VLM 이 같은 줄을 하위 옵션으로도 올려보내기 때문에
     #: 병합 단계에서 한 번 더 대조하려면 상계 전 값이 필요하다.
     summary_discount: int = 0
+    #: 배달비 순액(배달팁 할인·무료배달 상계 후). 0 이상.
+    #: None 이면 영수증에서 배달비 줄을 아예 보지 못했다는 뜻이다. 0(무료배달)과 구분해야
+    #: 병합 단계에서 VLM 이 품목으로 올린 배달비를 믿을지 정할 수 있다.
+    delivery_fee: int | None = None
 
 
 def _to_tokens(ocr_lines: list[dict]) -> list[Token]:
@@ -258,6 +315,96 @@ def _discount_kind(name: str | None, price: int | None) -> str | None:
     return "total" if _DISCOUNT_TOTAL_LABEL.search(compact) else "item"
 
 
+def _money_values(row: Row) -> set[int]:
+    return {v for v in (_money_value(tok.text) for tok in row.tokens) if v is not None}
+
+
+def _has_value_digits(row: Row) -> bool:
+    """이름 토큰이 아닌 곳에 숫자가 있는가. 금액을 찍었지만 OCR 이 깨뜨린 줄(`3.000`)을 가린다."""
+    return any(re.search(r"\d", tok.text) and not _HANGUL.search(tok.text) for tok in row.tokens)
+
+
+def _sum_fees(parents: list[int], children: list[int], offs: list[int]) -> int:
+    """상위 줄이 있으면 상위만, 없으면 내역을 더하고 감액을 뺀다. 0 미만은 0.
+
+    같은 금액의 상위 줄은 한 번만 센다. `배달팁 3,000` 이 두 군데 찍히거나 VLM 이 품목과
+    옵션으로 두 번 올린 경우다. 서로 다른 배달비가 우연히 같은 금액일 가능성보다
+    같은 줄을 두 번 읽었을 가능성이 훨씬 크다.
+    """
+    base = sorted(set(parents)) if parents else children
+    return max(0, sum(base) + sum(offs))
+
+
+def _delivery_fee(rows: list[Row]) -> int | None:
+    """영수증 전체에서 배달비 순액을 구한다.
+
+    금액을 읽은 배달비 줄이 없으면 순액은 None 이다. 0 으로 치면 VLM 이 제대로 읽은
+    배달비까지 버리게 되므로, None 을 돌려 병합 단계가 VLM 값을 쓰게 한다.
+
+    배민 주문전표는 배달비를 이렇게 찍는다.
+
+        배달팁                 0
+        ㄴ기본배달팁       4,100
+                          -4,100     <- 무료배달이면 바로 아래 음수 줄로 상계
+
+    - 배달비 줄 금액에 **바로 뒤따르는 이름 없는 음수 줄**을 더한다. 양수는 더하지 않는다.
+      이름 없는 양수 줄은 대개 다음 요약값(합계 등)이 줄바꿈된 것이다.
+    - 라벨 줄에 숫자가 아예 없으면 바로 **아래** 이름 없는 양수 줄을 값으로 빌린다. 라벨과
+      값이 y 로 갈라져 다른 행이 되는 경우다. 단,
+        * 라벨 줄에 숫자가 있는데 못 읽었으면(`3.000`) 빌리지 않는다. 그 아래 값은 남의 것이다.
+        * 그 다음 줄이 값 없는 라벨(`총결제금액`)이면 빌리지 않는다. 그 라벨의 값이다.
+        * 위 줄은 보지 않는다. 위의 이름 없는 값은 대개 앞 요약줄(주문금액)의 값이다.
+    - 한 행에 서로 다른 금액이 둘 이상이면 두 줄이 합쳐진 것이라 버린다.
+    - 상위·내역·감액 구분은 delivery_fee_label, 합산은 _sum_fees.
+    """
+    parents: list[int] = []
+    children: list[int] = []
+    offs: list[int] = []
+    for i, row in enumerate(rows):
+        parsed = _parse_row(row)
+        kind = delivery_fee_label(parsed["name"])
+        if kind is None:
+            continue
+        if len(_money_values(row)) > 1:
+            continue  # 두 줄이 한 행으로 합쳐졌다
+
+        amount = parsed["price"]
+        tail = i + 1
+        if amount is None and not _has_value_digits(row) and i + 1 < len(rows):
+            value = _parse_row(rows[i + 1])
+            after = _parse_row(rows[i + 2]) if i + 2 < len(rows) else None
+            # 다음 줄이 숫자가 아예 없는 라벨이면 이 값은 그 라벨 몫이다. 라벨에 깨진 숫자라도
+            # 있으면(`배달팁 할인 1.000`) 제 값을 들고 있는 것이라 남의 값을 빌리지 않는다.
+            owned_by_next_label = (
+                after is not None
+                and after["name"] is not None
+                and after["price"] is None
+                and not _has_value_digits(rows[i + 2])
+            )
+            if value["name"] is None and value["price"] and value["price"] > 0 and not owned_by_next_label:
+                amount = value["price"]
+                tail = i + 2
+        if amount is None:
+            continue  # 금액을 못 읽었다(`4.100`, `1;000` 등)
+
+        for j in range(tail, min(tail + 2, len(rows))):
+            follow = _parse_row(rows[j])
+            if follow["name"] is not None or follow["price"] is None or follow["price"] >= 0:
+                break
+            amount += follow["price"]
+
+        if kind == "off":
+            offs.append(-abs(amount))
+        elif kind == "parent":
+            parents.append(amount)
+        else:
+            children.append(amount)
+
+    if not (parents or children or offs):
+        return None
+    return _sum_fees(parents, children, offs)
+
+
 def analyze_receipt(ocr_lines: list[dict]) -> Layout:
     tokens = _to_tokens(ocr_lines)
     rows = group_rows(tokens)
@@ -274,8 +421,16 @@ def analyze_receipt(ocr_lines: list[dict]) -> Layout:
     items: list[LayoutItem] = []
     pending: dict | None = None  # 가격 없는 품목명 줄 (다음 가격 줄을 기다림)
     summary_discount = 0  # 합계부 할인 요약줄의 값 (품목별 합과 대조해 이중계상을 막는다)
+    delivery_fee = _delivery_fee(rows)
 
     for row in region:
+        if _DELIVERY_WORD.search(row.compact):
+            # 배달비는 품목이 아니라 delivery_fee 로 따로 센다. pending 도 비운다. 안 비우면
+            # 앞의 가격 없는 품목명 줄(`단무지 많이`)이 배달비 아래 값 행(`3,000`)이나
+            # 상계 행(`-3,000`)을 제 금액으로 가져가 품목이 된다. 비우고 나면 그 행들은
+            # 주인 없는 가격 줄이라 아래에서 버려진다.
+            pending = None
+            continue
         parsed = _parse_row(row)
         name, price, quantity = parsed["name"], parsed["price"], parsed["quantity"]
         compact_name = re.sub(r"\s+", "", name) if name else ""
@@ -370,4 +525,5 @@ def analyze_receipt(ocr_lines: list[dict]) -> Layout:
         total_amount=total,
         discount=receipt_discount,
         summary_discount=summary_discount,
+        delivery_fee=delivery_fee,
     )

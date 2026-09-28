@@ -23,7 +23,7 @@ from PIL import Image, ImageOps
 from pydantic import BaseModel, Field
 
 from corrector import KoreanCorrector, _jamo_distance, _jamo_seq
-from layout import analyze_receipt, _discount_kind
+from layout import _money_value, _sum_fees, analyze_receipt, delivery_fee_label, _discount_kind
 
 MAX_SIDE = 1536
 
@@ -57,13 +57,22 @@ app = FastAPI(
 
 class SubReceiptItem(BaseModel):
     name: str | None = Field(None, description="하위 옵션명", examples=["샷추가"])
-    price: int | None = Field(None, description="옵션 금액(원), 없으면 null", examples=[500])
+    price: int | None = Field(
+        None, description="옵션 추가금(원). 품목 price 에 더한다. 없으면 null", examples=[500]
+    )
 
 
 class ReceiptItem(BaseModel):
     name: str | None = Field(None, description="품목명 (보정 적용 후)", examples=["참치김밥"])
     quantity: int | None = Field(None, description="수량", examples=[1])
-    price: int | None = Field(None, description="할인 **전** 금액(원)", examples=[3500])
+    price: int | None = Field(
+        None,
+        description=(
+            "줄 금액(원). 옵션 제외, 할인 **전**, 수량 반영. "
+            "줄 최종 금액은 price + Σsub_items.price − discount 다."
+        ),
+        examples=[3500],
+    )
     discount: int = Field(
         0,
         description=(
@@ -92,6 +101,15 @@ class ReceiptResult(BaseModel):
         ),
         examples=[1000],
     )
+    delivery_fee: int = Field(
+        0,
+        description=(
+            "배달비(원). 배달팁 할인·무료배달을 상계한 순액이라 항상 0 이상이고, 없으면 0. "
+            "배달비는 items 에 넣지 않는다. 합계는 "
+            "Σ(price + Σsub_items.price − discount) − discount + delivery_fee 다."
+        ),
+        examples=[3000],
+    )
     total_amount: int | None = Field(None, description="할인이 모두 반영된 최종 결제 금액(원)", examples=[60000])
     payment_method: str | None = Field(None, description="결제 수단", examples=["카드"])
     total_verified: bool = Field(
@@ -111,7 +129,8 @@ class CorrectionEntry(BaseModel):
             "sub_promoted(잘못 하위로 묶인 품목을 최상위로 승격) | "
             "sub_reassigned(하위 옵션을 좌표상 실제 부모 품목으로 이동) | "
             "sub_demoted(옵션 마커가 남은 품목을 직전 품목의 하위로 강등) | "
-            "discount_from_sub(하위 옵션으로 잘못 올라온 할인 줄을 discount 로 이동)"
+            "discount_from_sub(하위 옵션으로 잘못 올라온 할인 줄을 discount 로 이동) | "
+            "delivery_fee_from_item(품목·옵션으로 올라온 배달비를 delivery_fee 로 이동)"
         ),
         examples=["confusion_swap"],
     )
@@ -566,6 +585,117 @@ def _fold_discount_subitems(kept: list[dict], corrections: list) -> int:
     return summary_from_subs
 
 
+def _as_int(value) -> int:
+    """VLM 금액을 정수로. 숫자가 아니면 `3,000` 같은 문자열까지 읽고, 못 읽으면 0."""
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, str):
+        return _money_value(value.strip()) or 0
+    return 0
+
+
+def _is_nameless_negative(entry: dict) -> bool:
+    """무료배달 상계 줄: 이름이 없고(한글 없음) 금액이 음수."""
+    name = entry.get("name")
+    return (not isinstance(name, str) or not re.search(r"[가-힣]", name)) and _as_int(entry.get("price")) < 0
+
+
+def _take_fees(entries: list[dict]) -> tuple[list[dict], list[tuple[str, int, str]]]:
+    """배달비 항목과 그 바로 뒤의 무료배달 상계 항목을 떼어낸다.
+
+    반환: (남은 항목, [(이름, 금액, 종류)]). 종류는 parent·child·off·waiver.
+    """
+    remaining: list[dict] = []
+    taken: list[tuple[str, int, str]] = []
+    after_fee = False
+    for entry in entries:
+        name = entry.get("name")
+        kind = delivery_fee_label(name)
+        if kind is not None:
+            taken.append((name, _as_int(entry.get("price")), kind))
+            after_fee = True
+            continue
+        if after_fee and _is_nameless_negative(entry):
+            taken.append((name or "(이름 없음)", _as_int(entry.get("price")), "waiver"))
+            continue
+        after_fee = False
+        remaining.append(entry)
+    return remaining, taken
+
+
+def _extract_delivery_fee(kept: list[dict], layout, corrections: list) -> int:
+    """배달비를 품목·하위 옵션에서 떼어내 delivery_fee 로 돌려준다.
+
+    VLM 프롬프트에는 배달비 필드가 없어서, 모델은 배달비를 품목(`배달비 2,000`)이나
+    직전 품목의 옵션으로 올려보내거나 아예 빠뜨린다. 품목에 남겨 두면 정산에서 메뉴처럼
+    나뉘고, delivery_fee 에도 넣으면 합계에서 두 번 더해진다.
+
+    **다른 병합 단계보다 먼저** 돌아야 한다. 늦게 떼면 그 사이에
+    - 무료배달 상계 `-4,100` 이 할인 접기(_fold_discount_subitems)에서 품목 할인이 되어 두 번 빠지고,
+    - 좌표 복구(_apply_layout)가 VLM 이 놓친 `군만두 3,000` 을 금액이 같은 `배달팁 3,000` 과
+      짝지어 되살리지 않고,
+    - 이름 병합(_merge_wrapped_names)이 뒤 품목을 배달비에 붙였다가 같이 버린다.
+
+    VLM 값도 좌표와 같은 규칙(상위·내역·감액, _sum_fees)으로 합친다. VLM 이 `배달팁 3,000` 을
+    품목과 옵션 양쪽에 올리거나 `ㄴ기본배달팁` 내역까지 올리면 그냥 더해서는 부풀어 오른다.
+    상계 줄이 배달비와 다른 층(배달비는 옵션, `-4,100` 은 품목)에 오면 같은 금액끼리 짝짓는다.
+
+    값은 좌표(layout)를 우선한다. layout 은 `기본배달팁 4,100` 바로 아래의 `-4,100`
+    (무료배달) 까지 보고 순액을 내지만, VLM 은 4,100 만 옮겨 적는 경우가 있다. layout 이
+    금액을 읽은 배달비 줄이 하나도 없을 때만 VLM 이 올린 값을 쓴다.
+    """
+    moved: list[tuple[str, int, str]] = []
+    remaining, taken = _take_fees(kept)
+    moved.extend(taken)
+    for item in remaining:
+        subs, taken = _take_fees(item.get("sub_items", []))
+        item["sub_items"] = subs
+        moved.extend(taken)
+
+    # 다른 층의 상계: 떼어낸 배달비 금액과 같은 크기의 이름 없는 음수 항목
+    unmatched = [price for _, price, kind in moved if kind in ("parent", "child") and price > 0]
+    for price in [price for _, price, kind in moved if kind == "waiver"]:
+        if -price in unmatched:
+            unmatched.remove(-price)
+
+    def strip_cross_level(entries: list[dict]) -> list[dict]:
+        out = []
+        for entry in entries:
+            amount = -_as_int(entry.get("price"))
+            if _is_nameless_negative(entry) and amount in unmatched:
+                unmatched.remove(amount)
+                moved.append((entry.get("name") or "(이름 없음)", -amount, "waiver"))
+                continue
+            out.append(entry)
+        return out
+
+    if unmatched:
+        remaining = strip_cross_level(remaining)
+        for item in remaining:
+            item["sub_items"] = strip_cross_level(item.get("sub_items", []))
+    kept[:] = remaining  # parsed["items"] 와 같은 리스트라 제자리에서 바꾼다
+
+    parents = [price for _, price, kind in moved if kind == "parent"]
+    children = [price for _, price, kind in moved if kind == "child"]
+    offs = [-abs(price) for _, price, kind in moved if kind == "off"]
+    waivers = [price for _, price, kind in moved if kind == "waiver"]
+    from_vlm = _sum_fees(parents, children, offs + waivers) if moved else 0
+
+    fee = layout.delivery_fee if layout.delivery_fee is not None else from_vlm
+    for name, price, _ in moved:
+        corrections.append(
+            {
+                "field": "delivery_fee",
+                "before": f"items: {name} {price:,}",
+                "after": f"delivery_fee: {fee:,}",
+                "reason": "delivery_fee_from_item",
+            }
+        )
+    return fee
+
+
 def _items_sum(items: list[dict]) -> int:
     """품목 합계. price 는 할인 전 금액이므로 귀속 할인을 여기서 뺀다.
 
@@ -596,6 +726,8 @@ def _merge(parsed: dict, ocr_lines: list[dict]) -> tuple[dict, list[dict]]:
     _pair_orphan_prices(kept, corrections)
     for item in kept:
         item["sub_items"] = [s for s in (item.get("sub_items") or []) if isinstance(s, dict)]
+    # 배달비는 다른 병합 단계보다 먼저 뗀다. 이유는 _extract_delivery_fee 참고.
+    parsed["delivery_fee"] = _extract_delivery_fee(kept, layout, corrections)
     _merge_wrapped_names(kept, corrections)
 
     for item in kept:
@@ -632,9 +764,9 @@ def _merge(parsed: dict, ocr_lines: list[dict]) -> tuple[dict, list[dict]]:
         elif t == layout_total:
             # "합계" 라벨 옆 숫자와 정확히 일치 (임의 숫자 일치 오검증 방지)
             parsed["total_verified"] = True
-        elif layout_total == _items_sum(kept) - parsed["discount"]:
+        elif layout_total == _items_sum(kept) - parsed["discount"] + parsed["delivery_fee"]:
             # VLM 합계가 라벨·품목합 모두와 어긋남 (과세물품가액을 합계로 착각하는 유형)
-            # -> 라벨 값과 (품목합 - 할인)이 서로 일치하면 그 값을 채택
+            # -> 라벨 값과 (품목합 - 할인 + 배달비)가 서로 일치하면 그 값을 채택
             parsed["total_amount"] = layout_total
             parsed["total_verified"] = True
             corrections.append(
