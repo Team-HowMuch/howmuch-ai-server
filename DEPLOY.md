@@ -126,7 +126,7 @@ adapter.out에 OCR Output Port 구현체를 만들어 `POST http://<홈서버IP>
     "store_name": "...", "purchased_at": "YYYY-MM-DD HH:MM",
     "items": [{"name": "...", "quantity": 1, "price": 0, "discount": 0,
                "sub_items": [{"name": "...", "price": 0}]}],
-    "discount": 0,
+    "discount": 0, "delivery_fee": 0,
     "total_amount": 0, "payment_method": "...", "total_verified": true
   },
   "corrections": [{"field": "item.name", "before": "잠치김밥", "after": "참치김밥", "reason": "ocr"}],
@@ -134,7 +134,7 @@ adapter.out에 OCR Output Port 구현체를 만들어 `POST http://<홈서버IP>
 }
 ```
 
-할인 필드(`discount`, `items[].discount`)의 정확한 의미와 검증식은 [README](README.md#할인-필드) 참고.
+금액 필드(`discount`, `items[].discount`, `delivery_fee`)의 정확한 의미와 검증식은 [README](README.md#금액-필드) 참고.
 
 ## 참고: 맥북 로컬 개발
 
