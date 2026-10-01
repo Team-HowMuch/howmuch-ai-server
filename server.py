@@ -9,6 +9,8 @@
 접속: 같은 와이파이에서 http://<맥북IP>:8600
 """
 import json
+import math
+import os
 import re
 import tempfile
 import threading
@@ -17,17 +19,16 @@ from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from pathlib import Path
 
-from fastapi import FastAPI, File, UploadFile
+from fastapi import FastAPI, File, Query, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse
 from PIL import Image, ImageOps
 from pydantic import BaseModel, Field
 
 from corrector import KoreanCorrector, _jamo_distance, _jamo_seq
+import preprocess as pre
 from layout import _money_value, _sum_fees, analyze_receipt, delivery_fee_label, _discount_kind
 
-MAX_SIDE = 1536
-
-PROMPT = """이 한국 영수증 이미지를 읽고 아래 JSON 형식으로만 답해줘. 다른 설명은 쓰지 마.
+PROMPT_V1 = """이 한국 영수증 이미지를 읽고 아래 JSON 형식으로만 답해줘. 다른 설명은 쓰지 마.
 {
   "store_name": "상호명",
   "purchased_at": "YYYY-MM-DD HH:MM",
@@ -41,6 +42,40 @@ PROMPT = """이 한국 영수증 이미지를 읽고 아래 JSON 형식으로만
 - 한국 영수증 날짜는 보통 년/월/일 순서야. 25/09/21은 2025-09-21이야.
 - 금액은 숫자만(콤마 없이) 적어.
 - 읽을 수 없는 값은 null로 해."""
+
+# v2: 실측 영수증에서 VLM 이 글자는 다 읽고도 칸을 잘못 채운 경우를 고친다.
+# - 배달비 칸이 없어서 배달팁을 넣을 곳이 없었다(요약 줄은 품목이 아니라고만 했다).
+# - 옵션 기호를 `-`, `*` 로만 알려줘 배민 전표의 `ㄴ` 옵션이 독립 품목이 됐다.
+# - 형식 예시가 `HH:MM` 고정이라 시각이 없는 영수증에 `00:00` 을 지어냈다.
+# - 배달 전표에서 배달 주소를 상호명으로 적었다.
+# - 옵션 금액까지 더한 줄 금액을 price 로 적는 경우가 있었다(계약은 옵션 제외).
+PROMPT_V2 = """이 한국 영수증 이미지를 읽고 아래 JSON 형식으로만 답해줘. 다른 설명은 쓰지 마.
+{
+  "store_name": "상호명",
+  "purchased_at": "YYYY-MM-DD HH:MM",
+  "items": [{"name": "품목명", "quantity": 1, "price": 0, "sub_items": [{"name": "옵션명", "price": 0}]}],
+  "delivery_fee": 0,
+  "total_amount": 0,
+  "payment_method": "카드 또는 현금"
+}
+규칙:
+- items에는 실제 구매한 상품만 넣어. 소계/부가세/과세물품가액/면세물품가액/합계/할인/포인트/결제수단 같은 요약 줄은 품목이 아니야.
+- 품목 바로 아래 줄이 ㄴ, └, -, *, +, > 같은 기호로 시작하거나 들여쓰기돼 있으면 옵션/추가선택(예: 샷추가, 사이즈업, 타피오카펄 추가)이야. 별도 품목이 아니라 바로 위 품목의 sub_items에 넣어. 없으면 빈 배열로 해.
+- price에는 그 품목 줄에 찍힌 금액만 적어. 아래 옵션 줄 금액을 더하지 마. 옵션 금액은 sub_items의 price에 영수증에 찍힌 그대로 적어.
+- 배달비·배달팁은 items에 넣지 말고 delivery_fee에 적어. 배달팁 할인이나 무료배달로 깎인 만큼 뺀 금액이야. 없으면 0으로 해.
+- store_name은 가게(판매처) 이름이야. 배달 주소, 배달앱 이름, 고객 정보, 카드사는 상호명이 아니야. 가게 이름이 안 보이면 null로 해.
+- purchased_at은 영수증에 시각이 찍혀 있을 때만 시:분을 적어. 시각이 없으면 날짜만 YYYY-MM-DD로 적어.
+- 한국 영수증 날짜는 보통 년/월/일 순서야. 25/09/21은 2025-09-21이야.
+- 금액은 숫자만(콤마 없이) 적어.
+- 읽을 수 없는 값은 null로 해."""
+
+PROMPTS = {"v1": PROMPT_V1, "v2": PROMPT_V2}
+# 요청이 고르지 않을 때 쓰는 기본값. 실측 비교가 끝날 때까지 기존 동작(v1, 전처리 없음)을 유지한다.
+DEFAULT_PROMPT = os.environ.get("VLM_PROMPT_VERSION", "v1").strip().lower()
+DEFAULT_PREPROCESS = os.environ.get("OCR_PREPROCESS", "")
+if DEFAULT_PROMPT not in PROMPTS:
+    raise RuntimeError(f"VLM_PROMPT_VERSION 은 {sorted(PROMPTS)} 중 하나여야 합니다: {DEFAULT_PROMPT!r}")
+pre.parse_steps(DEFAULT_PREPROCESS)  # 잘못된 기본값이면 기동 시점에 실패시킨다
 
 app = FastAPI(
     title="HowMuch 영수증 OCR API",
@@ -130,7 +165,8 @@ class CorrectionEntry(BaseModel):
             "sub_reassigned(하위 옵션을 좌표상 실제 부모 품목으로 이동) | "
             "sub_demoted(옵션 마커가 남은 품목을 직전 품목의 하위로 강등) | "
             "discount_from_sub(하위 옵션으로 잘못 올라온 할인 줄을 discount 로 이동) | "
-            "delivery_fee_from_item(품목·옵션으로 올라온 배달비를 delivery_fee 로 이동)"
+            "delivery_fee_from_item(품목·옵션으로 올라온 배달비를 delivery_fee 로 이동) | "
+            "invented_time(영수증에 없는 00:00 시각 제거)"
         ),
         examples=["confusion_swap"],
     )
@@ -140,7 +176,7 @@ class OcrLine(BaseModel):
     text: str = Field(description="OCR이 인식한 텍스트 라인")
     confidence: float = Field(description="인식 신뢰도 (0~1)")
     box: list[int] | None = Field(
-        None, description="텍스트 위치 [x1, y1, x2, y2] (리사이즈된 이미지 픽셀 기준)"
+        None, description="텍스트 위치 [x1, y1, x2, y2] (전처리를 마친 OCR 입력 이미지 픽셀 기준)"
     )
 
 
@@ -151,6 +187,13 @@ class OcrReceiptResponse(BaseModel):
     corrections: list[CorrectionEntry] = Field(default_factory=list, description="품목명 보정 내역")
     ocr_lines: list[OcrLine] = Field(default_factory=list, description="OCR 원본 인식 결과 (디버깅용)")
     raw: str = Field(description="비전 모델 원본 응답 (디버깅용)")
+    pipeline: dict | None = Field(
+        None,
+        description=(
+            "이 결과를 만든 설정 (디버깅용). prompt: VLM 프롬프트 버전, "
+            "preprocess: 적용한 전처리 단계와 잘라낸 영역·입력 크기, ocr_engine: OCR 엔진 버전"
+        ),
+    )
 
 
 class OcrErrorResponse(BaseModel):
@@ -160,11 +203,16 @@ _ocr_lock = threading.Lock()
 _executor = ThreadPoolExecutor(max_workers=2)
 _vlm = None
 _ocr_engine = None
+_ocr_engine_version = "unknown"
+#: OCR 엔진이 입력을 다시 줄이는 긴 변 상한. 엔진이 설정을 받아들였는지 응답에 남긴다.
+_ocr_max_side = 2000
 _corrector = None
 
 
 def _load_models():
-    global _vlm, _ocr_engine, _corrector
+    global _vlm, _ocr_engine, _ocr_engine_version, _ocr_max_side, _corrector
+    from importlib.metadata import PackageNotFoundError, version
+
     from rapidocr import LangRec, ModelType, OCRVersion, RapidOCR
 
     from vlm import create_vlm
@@ -172,20 +220,45 @@ def _load_models():
     _vlm = create_vlm()
 
     print("OCR 로드 중: PP-OCRv5 korean mobile")
-    _ocr_engine = RapidOCR(
-        params={
-            "Rec.lang_type": LangRec.KOREAN,
-            "Rec.ocr_version": OCRVersion.PPOCRV5,
-            "Rec.model_type": ModelType.MOBILE,
-        }
-    )
+    params = {
+        "Rec.lang_type": LangRec.KOREAN,
+        "Rec.ocr_version": OCRVersion.PPOCRV5,
+        "Rec.model_type": ModelType.MOBILE,
+    }
+    try:
+        # rapidocr 는 기본으로 긴 변이 2000px 를 넘는 입력을 다시 줄인다(Global.max_side_len).
+        # 그대로 두면 전처리 hires 로 넘긴 2560px 가 엔진 안에서 조용히 2000px 가 되어,
+        # 실측 기록과 실제 입력이 어긋난다. hires 상한에 맞춘다. 기본 입력(1536px)에는
+        # 영향이 없다.
+        _ocr_engine = RapidOCR(params={**params, "Global.max_side_len": pre.HIRES_MAX_SIDE})
+        _ocr_max_side = pre.HIRES_MAX_SIDE
+    except ValueError as exc:
+        # 이 키를 모르는 rapidocr 버전이면 기동 실패 대신 기본 상한으로 띄우고 응답에 남긴다.
+        print(f"경고: OCR 긴 변 상한을 바꾸지 못했다({exc}). 엔진 기본값으로 동작한다.")
+        _ocr_engine = RapidOCR(params=params)
+        _ocr_max_side = 2000
+    try:
+        # requirements 가 rapidocr 버전을 고정하지 않아 재빌드마다 달라질 수 있다.
+        # 실측 결과를 비교할 때 어느 엔진으로 나온 값인지 알 수 있게 응답에 남긴다.
+        _ocr_engine_version = version("rapidocr")
+    except PackageNotFoundError:
+        _ocr_engine_version = "unknown"
 
     _corrector = KoreanCorrector()
     print("모델 로드 완료")
 
 
-def _run_vlm(image_path: str) -> str:
-    return _vlm.generate(image_path, PROMPT)
+def _run_vlm(image_path: str, prompt: str) -> str:
+    return _vlm.generate(image_path, prompt)
+
+
+def _resolve_pipeline(prompt: str | None, preprocess: str | None) -> tuple[str, tuple[str, ...]]:
+    """요청 쿼리를 (프롬프트 버전, 전처리 단계) 로. 비어 있으면 기본값. 잘못되면 ValueError."""
+    version = (prompt or DEFAULT_PROMPT).strip().lower()
+    if version not in PROMPTS:
+        raise ValueError(f"알 수 없는 prompt: {version!r} (가능: {', '.join(sorted(PROMPTS))})")
+    steps = pre.parse_steps(DEFAULT_PREPROCESS if preprocess is None else preprocess)
+    return version, steps
 
 
 def _run_text_ocr(image_path: str) -> list[dict]:
@@ -429,13 +502,44 @@ def _apply_layout(kept: list[dict], layout, ocr_texts: list[str], corrections: l
 
 
 # VLM이 값을 못 찾을 때 프롬프트 예시를 그대로 돌려주는 경우
-_PLACEHOLDERS = {"store_name": "상호명", "payment_method": "카드 또는 현금", "purchased_at": "YYYY-MM-DD HH:MM"}
+# 프롬프트 v2 는 시각이 없으면 날짜만 적으라고 하면서 `YYYY-MM-DD` 를 함께 보여준다.
+_PLACEHOLDERS = {
+    "store_name": ("상호명",),
+    "payment_method": ("카드 또는 현금",),
+    "purchased_at": ("YYYY-MM-DD HH:MM", "YYYY-MM-DD"),
+}
 
 
 def _scrub_placeholders(parsed: dict):
-    for key, placeholder in _PLACEHOLDERS.items():
-        if parsed.get(key) == placeholder:
+    for key, placeholders in _PLACEHOLDERS.items():
+        if parsed.get(key) in placeholders:
             parsed[key] = None
+
+
+# VLM 이 적는 자정: `2026-09-03 00:00`, `… 0:00`, `…T00:00`, `… 00:00:00`
+_MIDNIGHT = re.compile(r"^(\d{4}-\d{2}-\d{2})[ T]0?0:00(?::00)?$")
+# 영수증에 찍힌 자정. `10:00:00` 안의 `00:00` 처럼 다른 시각의 일부는 아니어야 한다.
+# OCR 이 띄어 읽은 `00 : 00`, 12시간제 `오전 12:00`·`AM 12:00` 도 자정이다.
+_PRINTED_MIDNIGHT = re.compile(r"(?<![\d:])00\s*:\s*00(?!\d)|(오전|AM|am)\s*12\s*:\s*00(?!\d)")
+
+
+def _drop_invented_midnight(parsed: dict, ocr_lines: list[dict], corrections: list) -> None:
+    """영수증에 없는 `00:00` 시각을 지운다.
+
+    프롬프트 예시가 `YYYY-MM-DD HH:MM` 이라 VLM 은 시각이 없는 영수증(배민 주문전표 등)에도
+    `00:00` 을 채워 넣는다. 영수증 어디에도 `00:00` 이 찍혀 있지 않으면 지어낸 값이다.
+    진짜 자정 주문이면 OCR 에 `00:00` 이 남아 있으므로 그대로 둔다.
+    """
+    value = parsed.get("purchased_at")
+    match = _MIDNIGHT.match(value) if isinstance(value, str) else None
+    if not match:
+        return
+    if any(_PRINTED_MIDNIGHT.search(line.get("text") or "") for line in ocr_lines):
+        return
+    parsed["purchased_at"] = match.group(1)
+    corrections.append(
+        {"field": "purchased_at", "before": value, "after": match.group(1), "reason": "invented_time"}
+    )
 
 
 def _merge_wrapped_names(kept: list[dict], corrections: list):
@@ -589,8 +693,11 @@ def _as_int(value) -> int:
     """VLM 금액을 정수로. 숫자가 아니면 `3,000` 같은 문자열까지 읽고, 못 읽으면 0."""
     if isinstance(value, bool):
         return 0
-    if isinstance(value, (int, float)):
-        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        # json.loads 는 NaN·Infinity·1e400 을 그대로 float 로 준다. int() 가 터지면 500 이 된다.
+        return int(value) if math.isfinite(value) else 0
     if isinstance(value, str):
         return _money_value(value.strip()) or 0
     return 0
@@ -625,11 +732,14 @@ def _take_fees(entries: list[dict]) -> tuple[list[dict], list[tuple[str, int, st
     return remaining, taken
 
 
-def _extract_delivery_fee(kept: list[dict], layout, corrections: list) -> int:
+def _extract_delivery_fee(
+    kept: list[dict], layout, corrections: list, vlm_field: object = None
+) -> int:
     """배달비를 품목·하위 옵션에서 떼어내 delivery_fee 로 돌려준다.
 
-    VLM 프롬프트에는 배달비 필드가 없어서, 모델은 배달비를 품목(`배달비 2,000`)이나
-    직전 품목의 옵션으로 올려보내거나 아예 빠뜨린다. 품목에 남겨 두면 정산에서 메뉴처럼
+    프롬프트 v1 에는 배달비 필드가 없어서, 모델은 배달비를 품목(`배달비 2,000`)이나
+    직전 품목의 옵션으로 올려보내거나 아예 빠뜨린다. v2 는 `delivery_fee` 필드를 따로
+    받는다(vlm_field). 그래도 모델이 품목으로 올리는 경우가 남아 있어 떼는 일은 똑같이 한다. 품목에 남겨 두면 정산에서 메뉴처럼
     나뉘고, delivery_fee 에도 넣으면 합계에서 두 번 더해진다.
 
     **다른 병합 단계보다 먼저** 돌아야 한다. 늦게 떼면 그 사이에
@@ -683,6 +793,12 @@ def _extract_delivery_fee(kept: list[dict], layout, corrections: list) -> int:
     waivers = [price for _, price, kind in moved if kind == "waiver"]
     from_vlm = _sum_fees(parents, children, offs + waivers) if moved else 0
 
+    # 우선순위: 좌표가 읽은 배달비 줄 > VLM 이 품목·옵션으로 올린 배달비 > VLM 의 delivery_fee 칸.
+    # 품목에서 뗀 배달비가 있으면 그쪽이 무료배달 상계(`-3,000`)까지 담고 있다. 모델은 칸에는
+    # 상계 전 금액을 적는 경우가 있어, 칸은 품목에서 뗀 게 하나도 없을 때만 쓴다.
+    field = _as_int(vlm_field) if vlm_field is not None else 0
+    if not moved and field > 0:
+        from_vlm = field
     fee = layout.delivery_fee if layout.delivery_fee is not None else from_vlm
     for name, price, _ in moved:
         corrections.append(
@@ -720,6 +836,7 @@ def _merge(parsed: dict, ocr_lines: list[dict]) -> tuple[dict, list[dict]]:
     layout = analyze_receipt(ocr_lines)
 
     _scrub_placeholders(parsed)
+    _drop_invented_midnight(parsed, ocr_lines, corrections)
     items = parsed.get("items") or []
     kept = [it for it in items if not _SUMMARY_LINE.match((it.get("name") or "").strip())]
     parsed["items"] = kept
@@ -727,7 +844,9 @@ def _merge(parsed: dict, ocr_lines: list[dict]) -> tuple[dict, list[dict]]:
     for item in kept:
         item["sub_items"] = [s for s in (item.get("sub_items") or []) if isinstance(s, dict)]
     # 배달비는 다른 병합 단계보다 먼저 뗀다. 이유는 _extract_delivery_fee 참고.
-    parsed["delivery_fee"] = _extract_delivery_fee(kept, layout, corrections)
+    # 프롬프트 v2 는 VLM 이 delivery_fee 를 직접 적는다. 우리 값으로 덮기 전에 꺼내 둔다.
+    vlm_fee_field = parsed.pop("delivery_fee", None)
+    parsed["delivery_fee"] = _extract_delivery_fee(kept, layout, corrections, vlm_fee_field)
     _merge_wrapped_names(kept, corrections)
 
     for item in kept:
@@ -812,21 +931,45 @@ def startup():
         "- `result.total_verified`가 false면 합계를 사용자에게 확인받는 UX를 권장합니다."
     ),
 )
-async def ocr_receipt(file: UploadFile = File(..., description="영수증 이미지 파일")):
-    raw = await file.read()
-    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
-        tmp_path = tmp.name
+async def ocr_receipt(
+    file: UploadFile = File(..., description="영수증 이미지 파일"),
+    prompt: str | None = Query(
+        None,
+        description="실험용. VLM 프롬프트 버전(v1·v2). 비우면 서버 기본값(환경변수 VLM_PROMPT_VERSION)",
+    ),
+    preprocess: str | None = Query(
+        None,
+        description=(
+            "실험용. 쉼표로 고르는 전처리 단계(crop·hires·clahe). 빈 문자열이면 끔. "
+            "생략하면 서버 기본값(환경변수 OCR_PREPROCESS)"
+        ),
+    ),
+):
+    try:
+        version, steps = _resolve_pipeline(prompt, preprocess)
+    except ValueError as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
 
+    raw = await file.read()
+    paths: list[str] = []
     try:
         image = Image.open(BytesIO(raw))
         image = ImageOps.exif_transpose(image).convert("RGB")
-        if max(image.size) > MAX_SIDE:
-            image.thumbnail((MAX_SIDE, MAX_SIDE))
-        image.save(tmp_path, "JPEG", quality=92)
+        prepared = pre.prepare(image, steps)
+        # hires·clahe 를 켜면 OCR 입력이 VLM 입력과 달라 파일을 따로 쓴다. 같으면 예전처럼
+        # 파일 하나를 같이 쓴다(같은 이미지를 두 번 인코딩하지 않는다).
+        images = [prepared.vlm_image]
+        if prepared.ocr_image is not prepared.vlm_image:
+            images.append(prepared.ocr_image)
+        for img in images:
+            with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+                paths.append(tmp.name)
+            img.save(paths[-1], "JPEG", quality=92)
+        vlm_path, ocr_path = paths[0], paths[-1]
 
         start = time.perf_counter()
-        vlm_future = _executor.submit(_run_vlm, tmp_path)
-        ocr_future = _executor.submit(_run_text_ocr, tmp_path)
+        vlm_future = _executor.submit(_run_vlm, vlm_path, PROMPTS[version])
+        ocr_future = _executor.submit(_run_text_ocr, ocr_path)
         raw_text = vlm_future.result()
         ocr_lines = ocr_future.result()
         elapsed = round(time.perf_counter() - start, 1)
@@ -853,12 +996,19 @@ async def ocr_receipt(file: UploadFile = File(..., description="영수증 이미
                 "corrections": corrections,
                 "ocr_lines": ocr_lines,
                 "raw": raw_text,
+                "pipeline": {
+                    "prompt": version,
+                    "preprocess": prepared.info,
+                    "ocr_engine": f"rapidocr {_ocr_engine_version}",
+                    "ocr_max_side": _ocr_max_side,
+                },
             }
         )
     except Exception as e:  # 실측용 서버라 원인 그대로 노출
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
     finally:
-        Path(tmp_path).unlink(missing_ok=True)
+        for path in paths:
+            Path(path).unlink(missing_ok=True)
 
 
 @app.get("/", response_class=HTMLResponse, include_in_schema=False)
