@@ -112,6 +112,11 @@ docker compose down             # 전체 종료 (모델 캐시는 유지)
 | `VLM_BACKEND` | openai | vLLM API 호출 모드 |
 | `VLM_API_BASE` | http://vllm:8000/v1 | vLLM 주소 |
 | `VLM_MODEL` | Qwen/Qwen2.5-VL-7B-Instruct-AWQ | 모델 교체 시 vllm 서비스 command도 함께 변경 |
+| `VLM_PROMPT_VERSION` | v1 | 요청이 `prompt` 쿼리를 주지 않을 때 쓸 VLM 프롬프트 버전 (`v1`·`v2`) |
+| `OCR_PREPROCESS` | (빈 값) | 요청이 `preprocess` 쿼리를 주지 않을 때 쓸 전처리 (`crop`·`hires`·`clahe`, 쉼표로) |
+
+잘못된 값을 넣으면 API 컨테이너가 기동 단계에서 바로 실패한다. 조용히 무시하면
+의도와 다른 설정으로 실측하게 되기 때문이다.
 
 ## Spring 백엔드 연동 (추후)
 

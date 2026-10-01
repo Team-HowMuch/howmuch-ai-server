@@ -88,6 +88,18 @@ python3 -m venv .venv
 `sub_items` 는 품목에 붙는 하위 옵션(추가선택·사이즈업 등)이고 **할인이 아니다**.
 할인 줄은 `sub_items` 가 아니라 `discount` 로 간다.
 
+### 실험용 쿼리
+
+인식률 개선을 실측 영수증으로 비교하기 위한 옵션이다. 백엔드는 보내지 않으며, 생략하면
+서버 기본값(환경변수)을 쓴다. 응답의 `pipeline`에 실제로 적용된 설정이 남는다.
+
+| 쿼리 | 값 | 기본값(환경변수) |
+|---|---|---|
+| `prompt` | `v1`(기존) · `v2`(배달비 칸, `ㄴ` 옵션 기호, 시각 없으면 날짜만, 상호명 규칙) | `VLM_PROMPT_VERSION`, 없으면 `v1` |
+| `preprocess` | 쉼표로 `crop`(영수증 영역 잘라내기) · `hires`(OCR 입력만 긴 변 2560) · `clahe`(OCR 입력만 대비 보정). 빈 문자열이면 끔 | `OCR_PREPROCESS`, 없으면 끔 |
+
+예: `POST /ocr/receipt?prompt=v2&preprocess=crop,hires`
+
 `GET /` — 폰 카메라 촬영 테스트 페이지
 
 ## 주요 파일
