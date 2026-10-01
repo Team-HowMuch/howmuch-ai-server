@@ -16,6 +16,11 @@
           / 둘 다 미등록 → 혼동 자모(ㅊ↔ㅈ 등) 치환 보정
         · 합계: OCR 숫자와 대조해 total_verified 플래그
         · 요약 줄(부가세/과세물품가액 등) 품목 오분류 필터
+                              │
+                              ▼
+                          합계 검산 (reconcile.py)
+        · 실제 결제액 = Σ품목 − 할인 + 배달비 가 맞도록 새는 줄을 빼고
+          OCR 에 찍힌 할인·배달비를 채운다 → items_verified 플래그
 ```
 
 상세 설계: [docs/dual-model-ocr.md](docs/dual-model-ocr.md)
@@ -53,7 +58,7 @@ python3 -m venv .venv
     "items": [{"name": "...", "quantity": 1, "price": 0, "discount": 0,
                "sub_items": [{"name": "...", "price": 0}]}],
     "discount": 0, "delivery_fee": 0,
-    "total_amount": 0, "payment_method": "...", "total_verified": true
+    "total_amount": 0, "payment_method": "...", "total_verified": true, "items_verified": true
   },
   "corrections": [{"field": "item.name", "before": "잠치김밥", "after": "참치김밥", "reason": "ocr"}],
   "ocr_lines": [{"text": "...", "confidence": 0.98}]
@@ -70,11 +75,19 @@ python3 -m venv .venv
 | `discount` | 특정 품목에 귀속되지 않는 영수증 전체 단위 할인액 (0 이상, 없으면 0) |
 | `delivery_fee` | 배달비 순액. 배달팁 할인·무료배달을 상계한 값 (0 이상, 없으면 0) |
 
-줄 최종 금액은 `price + Σsub_items.price − items[].discount` 이고, 검증식
+줄 최종 금액은 `price + Σsub_items.price − items[].discount` 이다.
 
-`Σ(줄 최종 금액) − discount + delivery_fee == total_amount`
+| 플래그 | 뜻 |
+|---|---|
+| `total_verified` | `total_amount` 가 영수증에 찍힌 결제액·합계로 확인됐다 |
+| `items_verified` | `total_verified` 이고, 검증식 `Σ(줄 최종 금액) − discount + delivery_fee == total_amount` 도 성립한다 |
 
-이 성립하면 `total_verified: true` 가 된다.
+`items_verified: false` 면 품목·할인 중 놓치거나 잘못 읽은 줄이 있다는 뜻이다. 앱에서 품목 확인을
+받는 UX 를 권장한다. 실측 63장(정답지 대조)에서 `items_verified: true` 인 결과는 모두 정답이었다.
+
+`total_amount` 는 손님이 **실제로 낸 돈**이다. 배민 주문서의 `합계금액 23,300` 아래 `결제 금액 상세`
+에 `21,300`(채널할인 1,000 + 배달앱할인 1,000)이 찍혀 있으면 21,300 이 합계이고 2,000 은
+`discount` 로 들어간다. 카드 + 상품권·포인트 분할 결제는 합계가 그대로다.
 
 할인은 항상 **양수**로 내려간다. 영수증이 `-1,510`으로 찍든 `3,000`으로 찍든
 서버가 부호를 정규화한다. 포인트 사용·상품권 사용은 결제수단 분할이라 총액이 바뀌지
@@ -87,6 +100,30 @@ python3 -m venv .venv
 
 `sub_items` 는 품목에 붙는 하위 옵션(추가선택·사이즈업 등)이고 **할인이 아니다**.
 할인 줄은 `sub_items` 가 아니라 `discount` 로 간다.
+
+### 합계 검산
+
+병합 마지막에 `reconcile.py` 가 영수증에 찍힌 결제액을 검산 기준으로 결과를 고친다.
+
+1. 이름만 봐도 품목이 아닌 줄(`합할 계`, `가세(VAT):`, `카드/간편결제`, `적립포인트`)을 지운다.
+2. OCR 에서 결제액 후보를 찾는다: 결제 라벨(`결제금액`·`카드결제`·배민 `결제 금액 상세`) >
+   합계 라벨·두 번 이상 찍힌 금액·`합계 − 할인` > VLM 합계(OCR 근거가 하나도 없을 때만).
+3. 그 결제액을 맞추는 **가장 작은 수정**을 찾는다(최대 2개 + 번진 배달팁 1개).
+   - 뺄 수 있는 것: 좌표로 되살린 품목, 합계·세금 금액과 같은 품목·옵션, 다른 품목 금액을 끌어온 옵션,
+     요약줄이 한 번 더 붙은 품목 할인
+   - 더할 수 있는 것: OCR 에 찍힌 할인(음수 줄, 할인 어휘 줄, 결제 상세 할인), 번진 배달팁(차액)
+   - 고칠 수 있는 것: 단가를 금액으로 적은 품목(곱한 금액이 영수증에 찍혔을 때), 옵션 금액이 이미
+     들어간 줄 금액
+
+수정은 OCR 에 실제로 찍힌 금액에서만 고르고, 같은 비용으로 다른 결제액이 맞으면 아무것도 바꾸지
+않는다. 고친 내용은 `corrections` 에 남는다.
+
+| `corrections[].reason` | 뜻 |
+|---|---|
+| `label_dropped` | 품목이 아닌 라벨 줄을 지움 |
+| `reconciled` | 검산으로 고침(지운 줄, 더한 할인, 고친 금액, 채운 배달비, 바꾼 합계) |
+| `negative_item` | 음수 금액 품목(`(카드쿠폰) -12,000`)을 할인으로 바꿈 |
+| `option_demoted` | 품목으로 올라온 옵션 줄(`ㄴ타피오카펄 추가`, 배달 영수증의 `보통맛 0`)을 옵션으로 내림 |
 
 ### 실험용 쿼리
 
@@ -109,6 +146,9 @@ python3 -m venv .venv
 | `server.py` | FastAPI 서버, 이중 모델 병렬 실행 및 병합 |
 | `vlm.py` | VLM 백엔드 추상화 (MLX 로컬 / vLLM OpenAI 호환) |
 | `corrector.py` | 한국어 단어 검증(Kiwi) 및 혼동 자모 보정 |
+| `layout.py` | OCR 좌표로 줄·품목·할인·배달비·합계 복원 |
+| `reconcile.py` | 결제액 기준 합계 검산 |
+| `preprocess.py` | 실험용 이미지 전처리(crop·hires·clahe) |
 | `docker-compose.yml` | vLLM + API 운영 구성 |
 | `DEPLOY.md` | GPU 서버 배포, Funnel, systemd 자동 기동 |
 | `docs/dual-model-ocr.md` | 이중 모델 파이프라인 설계 |
