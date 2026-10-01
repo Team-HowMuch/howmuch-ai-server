@@ -201,10 +201,12 @@ def test_barcode_and_noise_rows_ignored():
         _line("꼬마김밥A", 100, 150),
         _line("3,500", 600, 200),
         _line("00", 900, 250),  # 잘린 인식 조각
-        _line("9,500", 600, 300),  # 품목명 줄 없는 가격 줄은 버린다
+        _line("9,500", 600, 300),  # 품목명 줄 없는 가격 줄은 이름 없는 자리로만 남는다
     ]
     layout = analyze_receipt(lines)
-    assert [(i.name, i.price) for i in layout.items] == [("꼬마김밥A", 3500)]
+    assert [(i.name, i.price) for i in layout.items if i.name] == [("꼬마김밥A", 3500)]
+    # 자리만 남길 뿐 품목으로 되살리지는 않는다(이름 없는 금액은 병합에서 복구 대상이 아니다)
+    assert [(i.name, i.price) for i in layout.items if not i.name] == [(None, 9500)]
 
 
 def test_delivery_receipt_options_and_tight_line_spacing():

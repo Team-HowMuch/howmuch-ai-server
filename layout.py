@@ -37,6 +37,9 @@ _REGION_END = re.compile(
 # 합계로 인정하는 라벨 (공백 제거 후 대조). 선결제는 배민 주문서의 결제액 줄.
 _TOTAL_LABEL = re.compile(r"합계|총액|총구매|총결제|결제금액|받을금액|선결제")
 
+# 다른 결제 수단 줄. 합계 라벨(`결제금액`)이 붙어 있어도 분할 결제의 일부라 합계로 쓰지 않는다.
+_TENDER_ROW = re.compile(r"포인트|상품권|캐시|기프트|마일리지|예치금")
+
 # 강한 라벨이 없을 때만 쓰는 보조 합계 라벨 (배달 영수증의 주문금액 = 품목 합)
 _TOTAL_LABEL_WEAK = re.compile(r"주문금액")
 
@@ -194,6 +197,8 @@ class Layout:
     #: None 이면 영수증에서 배달비 줄을 아예 보지 못했다는 뜻이다. 0(무료배달)과 구분해야
     #: 병합 단계에서 VLM 이 품목으로 올린 배달비를 믿을지 정할 수 있다.
     delivery_fee: int | None = None
+    #: 품목 영역이 끝나는 줄 번호(rows 기준). 그 뒤는 합계·세금·결제 같은 요약부다.
+    summary_start: int = 0
 
 
 def _to_tokens(ocr_lines: list[dict]) -> list[Token]:
@@ -423,6 +428,8 @@ def analyze_receipt(ocr_lines: list[dict]) -> Layout:
     summary_discount = 0  # 합계부 할인 요약줄의 값 (품목별 합과 대조해 이중계상을 막는다)
     delivery_fee = _delivery_fee(rows)
 
+    after_fee = False  # 바로 앞이 배달비 줄이면 그 아래 음수는 무료배달 상계다
+    negatives: list[int] = []  # 품목 영역에서 지금까지 본 음수 금액들
     for row in region:
         if _DELIVERY_WORD.search(row.compact):
             # 배달비는 품목이 아니라 delivery_fee 로 따로 센다. pending 도 비운다. 안 비우면
@@ -430,9 +437,29 @@ def analyze_receipt(ocr_lines: list[dict]) -> Layout:
             # 상계 행(`-3,000`)을 제 금액으로 가져가 품목이 된다. 비우고 나면 그 행들은
             # 주인 없는 가격 줄이라 아래에서 버려진다.
             pending = None
+            after_fee = True
             continue
         parsed = _parse_row(row)
         name, price, quantity = parsed["name"], parsed["price"], parsed["quantity"]
+        if name is not None:
+            after_fee = False
+
+        # 이름 없는 음수 줄은 할인이다. 홈푸드마트는 `$특매할인 -400` 의 라벨을 OCR 이 자주
+        # 떨어뜨려 `1  -400  -400` 만 남는다. 지금까지 품목에 붙인 할인의 합과 같으면
+        # 품목별 할인을 다시 적은 요약줄(`할인금액 -1,910` 의 라벨이 떨어진 것)이다.
+        if price is not None and price < 0:
+            restated = _is_restated_discount(price, negatives, named=name is not None)
+            negatives.append(abs(price))
+            if name is None or restated:
+                if after_fee:
+                    continue  # 무료배달 상계 — 배달비 순액에서 이미 셌다
+                if restated or not items:
+                    summary_discount += abs(price)
+                else:
+                    items[-1].discount += abs(price)
+                    items[-1].discount_amounts.append(abs(price))
+                pending = None
+                continue
         compact_name = re.sub(r"\s+", "", name) if name else ""
         if compact_name and (_LABEL_NAME.search(compact_name) or _TOTAL_LABEL.search(compact_name)):
             continue  # 요약/전표/합계 라벨 줄은 품목도 pending도 아니다
@@ -488,7 +515,11 @@ def analyze_receipt(ocr_lines: list[dict]) -> Layout:
                     )
                 )
                 pending = None
-            # 직전 품목명 줄이 없으면 이름 없는 가격 줄이므로 버린다
+            elif price > 0:
+                # 이름을 못 읽은 가격 줄도 자리는 남긴다. 이름 없이 금액만 있는 품목이라 복구는
+                # 안 하지만, 바로 아래 할인 줄이 엉뚱한 위 품목에 붙지 않고, 병합 단계가 금액으로
+                # VLM 품목과 짝지어 할인을 제 품목에 붙일 수 있다.
+                items.append(LayoutItem(name=None, quantity=quantity, price=price))
         # 이름도 가격도 없는 줄(바코드 조각 등)은 무시
 
     # 품목 영역 밖의 할인 요약줄도 줍는다. 배달앱은 할인을 품목 영역이 끝난 뒤
@@ -508,6 +539,8 @@ def analyze_receipt(ocr_lines: list[dict]) -> Layout:
     weak_total = None
     for row in rows:
         compact = row.compact
+        if _TENDER_ROW.search(compact):
+            continue  # `포인트결제금액 3,000`·`상품권 5,000` 은 분할 결제의 일부지 합계가 아니다
         if _TOTAL_LABEL.search(compact):
             value = _parse_row(row)["price"]
             # "받을금액: 0"(미수금) 같은 0원 라벨이 실제 합계를 덮어쓰지 않게 한다
@@ -526,4 +559,16 @@ def analyze_receipt(ocr_lines: list[dict]) -> Layout:
         discount=receipt_discount,
         summary_discount=summary_discount,
         delivery_fee=delivery_fee,
+        summary_start=end,
     )
+
+
+def _is_restated_discount(price: int, negatives: list[int], named: bool) -> bool:
+    """이 음수가 위에서 본 할인들의 합을 다시 적은 요약값인가.
+
+    할인이 하나뿐이면 같은 금액이 품목마다 우연히 반복될 수 있다(`-400`, `-400`). 그래서
+    하나짜리는 라벨이 붙은 줄(`과 -1,510` = 깨진 `할인금액`)일 때만 요약으로 본다.
+    """
+    if not negatives or abs(price) != sum(negatives):
+        return False
+    return len(negatives) >= 2 or named

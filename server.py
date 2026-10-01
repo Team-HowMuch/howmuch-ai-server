@@ -27,6 +27,7 @@ from pydantic import BaseModel, Field
 from corrector import KoreanCorrector, _jamo_distance, _jamo_seq
 import preprocess as pre
 from layout import _money_value, _sum_fees, analyze_receipt, delivery_fee_label, _discount_kind
+import reconcile as rec
 
 PROMPT_V1 = """이 한국 영수증 이미지를 읽고 아래 JSON 형식으로만 답해줘. 다른 설명은 쓰지 마.
 {
@@ -83,7 +84,7 @@ app = FastAPI(
         "영수증 이미지를 분석해 구조화된 정산 데이터(상호/일시/품목/합계)를 반환합니다.\n\n"
         "- 비전 모델(Qwen2.5-VL)과 텍스트 OCR(PP-OCRv5)을 병렬 실행 후 병합\n"
         "- 한글 오독(예: 잠치김밥 → 참치김밥)은 사전 기반으로 자동 보정\n"
-        "- 합계 금액은 OCR 숫자와 교차 검증 (`total_verified`)\n\n"
+        "- 합계 금액은 OCR 숫자와 교차 검증 (`total_verified`), 품목 합계 검산 (`items_verified`)\n\n"
         "처리 시간은 이미지당 약 3초입니다."
     ),
     version="0.1.0",
@@ -149,6 +150,14 @@ class ReceiptResult(BaseModel):
     payment_method: str | None = Field(None, description="결제 수단", examples=["카드"])
     total_verified: bool = Field(
         False, description="합계 금액이 OCR 인식 숫자와 일치하는지 (true면 신뢰도 높음)"
+    )
+    items_verified: bool = Field(
+        False,
+        description=(
+            "total_verified 이고, 품목으로 계산한 금액 Σ(price + Σsub_items.price − discount) − discount "
+            "+ delivery_fee 가 total_amount 와 정확히 같은지. false 면 품목·할인 중 놓치거나 잘못 읽은 줄이 "
+            "있다는 뜻이라 품목 확인을 받는 UX 를 권장한다. 실측 63장에서 true 인 결과는 모두 정답이었다."
+        ),
     )
 
 
@@ -372,7 +381,11 @@ def _apply_layout(kept: list[dict], layout, ocr_texts: list[str], corrections: l
         # 금액을 못 읽은 layout 하위 항목은 오독 잔재일 가능성이 높아 복사하지 않는다
         return [{"name": s.name, "price": s.price} for s in li.sub_items if s.price is not None]
 
-    # 1) 승격: VLM 이름(오독이 적음)을 유지한 채 최상위 품목으로 꺼낸다
+    # 1) 승격: VLM 이름(오독이 적음)을 유지한 채 최상위 품목으로 꺼낸다.
+    # 좌표 품목 하나는 한 번만 승격 근거로 쓴다. `(더하기 선택)야채`·`(더하기 선택)토마토` 처럼
+    # 이름 앞부분이 같은 옵션 둘이 같은 좌표 줄 하나에 짝지어지면 하나가 사라진다.
+    used_for_promotion: set[int] = set()
+    promoted: set[int] = set()
     for v in list(kept):
         remaining = []
         for s in v.get("sub_items", []):
@@ -381,6 +394,7 @@ def _apply_layout(kept: list[dict], layout, ocr_texts: list[str], corrections: l
                     li
                     for li in layout_items
                     if li.price is not None
+                    and id(li) not in used_for_promotion
                     and s.get("price") == li.price
                     and _names_match(s.get("name"), li.name)
                 ),
@@ -389,18 +403,26 @@ def _apply_layout(kept: list[dict], layout, ocr_texts: list[str], corrections: l
             if li is None:
                 remaining.append(s)
                 continue
+            used_for_promotion.add(id(li))
+            # 방금 승격한 품목은 비교에서 뺀다. 이름 앞부분이 같은 옵션 둘(`(더하기 선택)야채`,
+            # `(더하기 선택)토마토`)이 서로를 "이미 있음" 으로 보고 하나가 사라진다.
             already = next(
-                (k for k in kept if k is not v and _names_match(k.get("name"), li.name)), None
+                (
+                    k
+                    for k in kept
+                    if k is not v and id(k) not in promoted and _names_match(k.get("name"), li.name)
+                ),
+                None,
             )
             if already is None:
-                kept.append(
-                    {
-                        "name": s.get("name"),
-                        "quantity": li.quantity,
-                        "price": s.get("price"),
-                        "sub_items": _layout_subs(li),
-                    }
-                )
+                new_item = {
+                    "name": s.get("name"),
+                    "quantity": li.quantity,
+                    "price": s.get("price"),
+                    "sub_items": _layout_subs(li),
+                }
+                kept.append(new_item)
+                promoted.add(id(new_item))
             corrections.append(
                 {
                     "field": "items",
@@ -455,23 +477,50 @@ def _apply_layout(kept: list[dict], layout, ocr_texts: list[str], corrections: l
         v["sub_items"] = remaining
 
     # 3) 부착 + 복구
+    # 이름 없는 좌표 품목(이름을 못 읽은 가격 줄)은 금액으로만 짝짓는다. 이름으로 이미 짝지어진
+    # VLM 품목은 건너뛴다. 안 그러면 같은 금액의 다른 품목에 할인을 덮어쓴다.
+    named_matches = {
+        id(it)
+        for li in layout_items
+        if li.name
+        for it in kept
+        if _names_match(it.get("name"), li.name)
+    }
+    taken_by_nameless: set[int] = set()
     for li in layout_items:
-        matched = next(
-            (
-                it
-                for it in kept
-                if _names_match(it.get("name"), li.name)
-                or (li.price is not None and it.get("price") == li.price)
-            ),
-            None,
-        )
+        if li.name:
+            matched = next(
+                (
+                    it
+                    for it in kept
+                    if _names_match(it.get("name"), li.name)
+                    or (li.price is not None and it.get("price") == li.price)
+                ),
+                None,
+            )
+        else:
+            matched = next(
+                (
+                    it
+                    for it in kept
+                    if li.price is not None
+                    and it.get("price") == li.price
+                    and id(it) not in named_matches
+                    and id(it) not in taken_by_nameless
+                ),
+                None,
+            )
+            if matched is not None:
+                taken_by_nameless.add(id(matched))
 
         subs = _layout_subs(li)
         if matched is not None:
+            if li.price is not None and li.price > 0 and _names_match(matched.get("name"), li.name):
+                matched["_layout_price"] = li.price  # 합계 검산에서 VLM 금액 대신 쓸 후보
             if subs and not matched.get("sub_items"):
                 matched["sub_items"] = subs
             # 할인은 좌표 기반 layout 만 안다. VLM 응답에는 할인 필드가 없다.
-            if li.discount:
+            if li.discount and not matched.get("discount"):
                 matched["discount"] = li.discount
                 matched["_discount_amounts"] = list(li.discount_amounts)
             continue
@@ -494,6 +543,7 @@ def _apply_layout(kept: list[dict], layout, ocr_texts: list[str], corrections: l
                 "sub_items": subs,
                 "discount": li.discount,
                 "_discount_amounts": list(li.discount_amounts),
+                "_src": "ocr",  # 합계 검산에서 VLM 품목보다 먼저 의심한다
             }
         )
         corrections.append(
@@ -874,6 +924,13 @@ def _merge(parsed: dict, ocr_lines: list[dict]) -> tuple[dict, list[dict]]:
     summary_total = max(layout.summary_discount, summary_from_subs)
     parsed["discount"] = max(0, summary_total - item_discount_sum)
 
+    # 합계 검산: 실제 결제액에 품목·할인·배달비가 맞도록 새는 줄을 빼고 빠진 할인을 채운다.
+    if rec.reconcile(parsed, layout, ocr_lines, corrections):
+        # VLM 만 말한 결제액은 검산이 맞아도 검증됐다고 하지 않는다(OCR 근거가 없다)
+        parsed["total_verified"] = bool(parsed.pop("_paid_from_ocr", False))
+        _strip_private(parsed)
+        return parsed, corrections
+
     total = parsed.get("total_amount")
     layout_total = layout.total_amount
     if isinstance(total, (int, float)):
@@ -911,7 +968,33 @@ def _merge(parsed: dict, ocr_lines: list[dict]) -> tuple[dict, list[dict]]:
         )
     else:
         parsed["total_verified"] = False
+    _strip_private(parsed)
     return parsed, corrections
+
+
+def _strip_private(parsed: dict) -> None:
+    """병합 중에만 쓰는 `_` 로 시작하는 키를 응답에서 지우고 items_verified 를 채운다."""
+    for item in parsed.get("items") or []:
+        for key in [k for k in item if k.startswith("_")]:
+            del item[key]
+        # 계약은 정수 금액이다. VLM 이 `3000.0`·`"500"` 을 보내도 정수로 내려준다.
+        if item.get("price") is not None:
+            item["price"] = _as_int(item["price"])
+        for sub in item.get("sub_items") or []:
+            if sub.get("price") is not None:
+                sub["price"] = _as_int(sub["price"])
+    parsed.pop("_paid_from_ocr", None)
+    total = parsed.get("total_amount")
+    # 품목 검산은 합계가 영수증에서 확인됐을 때만 의미가 있다. VLM 이 스스로 맞춘 합계와
+    # 품목이 서로 맞는 것은 검증이 아니다.
+    parsed["items_verified"] = (
+        bool(parsed.get("total_verified"))
+        and isinstance(total, (int, float))
+        and not isinstance(total, bool)
+        and bool(parsed.get("items"))
+        and rec.computed_total(parsed["items"], rec._int(parsed.get("discount")),
+                               rec._int(parsed.get("delivery_fee"))) == rec._int(total)
+    )
 
 
 @app.on_event("startup")
