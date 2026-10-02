@@ -121,7 +121,10 @@ def delivery_fee_label(name) -> str | None:
 _DELIVERY_WORD = re.compile(r"배달(비(?!대면)|팁|료|요금)|배송비|무료배달")
 
 # 하위 옵션 접두 기호
-_SUB_PREFIX = re.compile(r"^[-*+└ㄴ>›»▶►▸~]|^\(추가|^옵션")
+# `(선택)곱빼기`·`(더하기 선택(최대 5개))야채` 도 옵션 표기다.
+_SUB_PREFIX = re.compile(r"^[-*+└ㄴ>›»▶►▸~]|^\((추가|선택|변경|더하기)|^옵션")
+# 기호만으로 옵션이라고 믿을 만한 것. `-`·`*`·`~` 나 `(선택)` 은 안내문·장식에도 쓰여 약하다.
+_STRONG_SUB_MARK = re.compile(r"^[+└ㄴ>›»▶►▸]")
 
 
 @dataclass
@@ -167,6 +170,8 @@ class Row:
 class LayoutSubItem:
     name: str
     price: int | None
+    marked: bool = False  # 이름 앞에 옵션 기호(`ㄴ`·`+`·`-`…)가 찍혀 있었다(들여쓰기만으로 옵션이라 본 줄이 아니다)
+    strong: bool = False  # 그 기호가 `ㄴ`·`+`·`>` 처럼 옵션에만 쓰이는 것이다
 
 
 @dataclass
@@ -511,7 +516,13 @@ def analyze_receipt(ocr_lines: list[dict]) -> Layout:
 
     after_fee = False  # 바로 앞이 배달비 줄이면 그 아래 음수는 무료배달 상계다
     negatives: list[int] = []  # 품목 영역에서 지금까지 본 음수 금액들
-    for row in region:
+    prev_was_sub = False  # 바로 앞 줄이 하위 옵션 줄이었나
+    prev_sub_x = 0.0  # 바로 앞 옵션 줄이 시작한 x
+    prev_orphan_sub = False  # 바로 앞 줄이 붙일 품목이 없는 옵션 줄이었나
+    for ri, row in enumerate(region):
+        was_sub, was_orphan = prev_was_sub, prev_orphan_sub
+        prev_was_sub = prev_orphan_sub = False
+        nxt = _parse_row(region[ri + 1]) if ri + 1 < len(region) else None
         if _DELIVERY_WORD.search(row.compact):
             # 배달비는 품목이 아니라 delivery_fee 로 따로 센다. pending 도 비운다. 안 비우면
             # 앞의 가격 없는 품목명 줄(`단무지 많이`)이 배달비 아래 값 행(`3,000`)이나
@@ -567,11 +578,29 @@ def analyze_receipt(ocr_lines: list[dict]) -> Layout:
             or (price is not None and price < 0)  # 할인 어휘가 없는 음수 줄
         )
 
+        # 기호가 떨어진 옵션 줄: 앞 옵션 줄보다 기호 폭만큼(한 글자쯤) 안쪽에서 시작한다. 옵션이 있는
+        # 품목이 연달아 오면 품목 줄도 옵션 줄 사이에 끼므로(`김밥 / +치즈 / 라면 / +계란`), 끼어 있다는 것만으로는
+        # 옵션이라 하지 않고 안쪽에서 시작할 때만 그렇게 본다.
+        if (not is_sub and name is not None and price is not None and price > 0 and was_sub and char_w):
+            dx = row.x1 - prev_sub_x
+            sandwiched = nxt is not None and nxt["name"] is not None and bool(_SUB_PREFIX.match(nxt["name"]))
+            if dx >= 0.6 * char_w or (sandwiched and dx >= 0.3 * char_w):
+                is_sub = True
+
         if is_sub:
             if items:
                 items[-1].sub_items.append(
-                    LayoutSubItem(name=re.sub(r"^[-*+└>›»▶►▸~\s]+", "", name), price=price)
+                    LayoutSubItem(
+                        name=re.sub(r"^[-*+└ㄴ>›»▶►▸~\s]+", "", name),
+                        price=price,
+                        marked=bool(_SUB_PREFIX.match(name)),
+                        strong=bool(_STRONG_SUB_MARK.match(name)),
+                    )
                 )
+                prev_was_sub = True  # 붙일 품목이 없던 줄은 옵션 블록이 아니다
+                prev_sub_x = row.x1
+            else:
+                prev_orphan_sub = True
             continue
         if name and price is not None:
             items.append(
@@ -584,7 +613,8 @@ def analyze_receipt(ocr_lines: list[dict]) -> Layout:
             )
             pending = None
         elif name:
-            pending = parsed
+            # 부모를 못 찾은 옵션 줄 바로 뒤의 이름 조각(`추가`, `도 추가`)은 그 옵션 이름이 줄바꿈된 것이다
+            pending = None if was_orphan else parsed
         elif price is not None:
             if pending is not None:
                 items.append(

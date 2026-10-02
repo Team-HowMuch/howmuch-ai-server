@@ -1575,3 +1575,315 @@ def test_blurry_line_is_not_restored_while_a_vlm_item_has_no_price():
     }
     merged, _ = _merge_with(parsed, lines)
     assert [i["name"] for i in merged["items"]].count("가나다라") == 0
+
+
+# ---------------------------------------------------------------- 옵션(하위목록) 판정
+
+def _opt_receipt(rows):
+    """rows: (텍스트, x, 금액 또는 None) 목록으로 합성 영수증을 만든다."""
+    lines = list(_HEADER)
+    y = 150
+    for text, x, price in rows:
+        lines.append(_line(text, x, y))
+        if price:
+            lines.append(_line(price, 600, y))
+        y += 40
+    lines += [_line("합계", 100, y + 20), _line("99,999", 600, y + 20)]
+    return lines
+
+
+def _subs(layout):
+    return [(li.name, [(s.name, s.price) for s in li.sub_items]) for li in layout.items]
+
+
+def test_unmarked_row_between_marked_options_is_an_option():
+    """`+` 를 OCR 이 떨어뜨린 줄(`토네이도소세지 1개`)이 앞뒤 옵션 사이에 끼면 같은 옵션이다."""
+    layout = analyze_receipt(_opt_receipt([
+        ("메가치킨마요", 100, "7,800"),
+        ("+스팸1조각", 100, "1,700"),
+        ("토네이도소세지", 120, "2,100"),
+        ("+치킨1조각", 100, "1,600"),
+        ("해시포테이토", 100, "2,600"),
+    ]))
+    assert _subs(layout) == [
+        ("메가치킨마요", [("스팸1조각", 1700), ("토네이도소세지", 2100), ("치킨1조각", 1600)]),
+        ("해시포테이토", []),
+    ]
+
+
+def test_unmarked_row_indented_past_the_previous_option_is_an_option():
+    layout = analyze_receipt(_opt_receipt([
+        ("베이컨로제파스타", 100, "12,500"),
+        ("+소스1단계", 100, "500"),
+        ("그릴드치킨추가", 120, "2,000"),  # 기호 한 글자만큼 안쪽에서 시작
+        ("사이다", 100, "2,000"),
+    ]))
+    assert _subs(layout) == [
+        ("베이컨로제파스타", [("소스1단계", 500), ("그릴드치킨추가", 2000)]),
+        ("사이다", []),
+    ]
+
+
+def test_item_right_after_an_option_block_stays_an_item():
+    """옵션 블록 바로 뒤의 새 품목은 앞 옵션과 같은 x 에서 시작한다 — 옵션으로 흡수하지 않는다."""
+    layout = analyze_receipt(_opt_receipt([
+        ("김밥", 100, "3,000"),
+        ("+치즈추가", 100, "500"),
+        ("라면", 100, "4,000"),
+    ]))
+    assert _subs(layout) == [("김밥", [("치즈추가", 500)]), ("라면", [])]
+
+
+def test_selection_labels_and_strong_markers():
+    """`(선택)곱빼기` 는 옵션이지만 기호만으로 믿을 만하진 않다(약함). `ㄴ` 는 강하다."""
+    layout = analyze_receipt(_opt_receipt([
+        ("불닭마요덮밥", 100, "10,400"),
+        ("(선택)곱빼기", 100, "2,000"),
+        ("ㄴ소스1단계", 100, None),
+        ("-서비스음료", 100, None),
+    ]))
+    li = layout.items[0]
+    assert [(s.name, s.marked, s.strong) for s in li.sub_items] == [
+        ("(선택)곱빼기", True, False), ("소스1단계", True, True), ("서비스음료", True, False)]
+
+
+def test_item_name_that_starts_with_a_quote_is_an_item():
+    layout = analyze_receipt(_opt_receipt([
+        ("김밥", 100, "3,000"),
+        ('"시그니처"세트', 100, "12,000"),
+        ("라면", 100, "4,000"),
+    ]))
+    assert [(li.name, li.sub_items) for li in layout.items] == [
+        ("김밥", []), ('"시그니처"세트', []), ("라면", [])]
+
+
+def test_consecutive_items_that_each_have_options_are_not_merged():
+    """`김밥 / +치즈 / 라면 / +계란` — 라면은 옵션 줄 사이에 끼었지만 새 품목이다."""
+    layout = analyze_receipt(_opt_receipt([
+        ("김밥", 100, "3,000"),
+        ("+치즈추가", 100, "500"),
+        ("라면", 100, "4,000"),
+        ("+계란추가", 100, "500"),
+        ("사이다", 100, "2,000"),
+    ]))
+    assert _subs(layout) == [("김밥", [("치즈추가", 500)]), ("라면", [("계란추가", 500)]), ("사이다", [])]
+
+
+def test_name_fragment_after_an_orphan_option_row_is_not_a_new_item():
+    """부모를 못 찾은 옵션 줄 다음의 `추가` 조각이 가격 줄과 짝지어 품목이 되면 안 된다."""
+    layout = analyze_receipt(_opt_receipt([
+        ("(더하기선택)야채", 100, "500"),
+        ("추가", 100, None),
+        ("", 100, "500"),
+    ]))
+    assert not any(li.name == "추가" for li in layout.items)
+
+
+def test_option_row_without_a_parent_does_not_start_an_option_block():
+    """붙일 품목이 없던 옵션 모양 줄 바로 뒤의 첫 품목을 옵션으로 삼키면 안 된다."""
+    layout = analyze_receipt(_opt_receipt([
+        ("(밝은지)", 140, None),
+        ("(컵)더블주니어", 100, "5,100"),
+        (">그린티", 100, None),
+    ]))
+    assert _subs(layout) == [("(컵)더블주니어", [("그린티", None)])]
+
+
+def test_indent_only_option_is_not_marked():
+    layout = analyze_receipt(_opt_receipt([
+        ("김밥", 100, "3,000"),
+        ("치즈추가", 160, "500"),  # 기호 없이 들여쓰기만(3글자)
+    ]))
+    subs = layout.items[0].sub_items
+    assert [(s.name, s.marked) for s in subs] == [("치즈추가", False)]
+
+
+def _item(name, price, subs=None):
+    return {"name": name, "quantity": 1, "price": price, "sub_items": subs or []}
+
+
+def test_vlm_item_that_the_layout_reads_as_an_option_is_demoted_under_its_parent():
+    lines = _opt_receipt([
+        ("메가치킨마요", 100, "7,800"),
+        ("+스팸1조각", 100, "1,700"),
+        ("토네이도소세지", 120, "2,100"),
+        ("+치킨1조각", 100, "1,600"),
+        ("해시포테이토", 100, "2,600"),
+    ])
+    parsed = {
+        "items": [
+            _item("메가치킨마요", 7800, [{"name": "스팸1조각", "price": 1700}]),
+            _item("토네이도소세지", 2100, [{"name": "치킨1조각", "price": 1600}]),  # VLM 이 옵션을 품목으로 올림
+            _item("해시포테이토", 2600),
+        ],
+        "total_amount": 15800, "payment_method": "카드",
+    }
+    merged, corr = _merge_with(parsed, lines)
+    assert [i["name"] for i in merged["items"]] == ["메가치킨마요", "해시포테이토"]
+    assert [(s["name"], s["price"]) for s in merged["items"][0]["sub_items"]] == [
+        ("스팸1조각", 1700), ("토네이도소세지", 2100), ("치킨1조각", 1600)]
+    assert any(c["reason"] == "sub_demoted" for c in corr)
+
+
+def test_item_is_not_demoted_when_the_layout_also_reads_it_as_an_item():
+    lines = _opt_receipt([
+        ("국수", 100, "5,000"),
+        ("+계란", 100, "500"),
+        ("계란", 100, "500"),  # 같은 이름·금액을 최상위 품목으로도 읽었다 — 모호하다
+    ])
+    parsed = {"items": [_item("국수", 5000), _item("계란", 500)], "total_amount": 5500, "payment_method": "카드"}
+    merged, corr = _merge_with(parsed, lines)
+    assert not any(c["reason"] == "sub_demoted" for c in corr)
+    assert [i["name"] for i in merged["items"]] == ["국수", "계란"]
+
+
+def test_demotion_needs_the_parent_item_to_exist():
+    lines = _opt_receipt([("국수", 100, "5,000"), ("+계란", 100, "500")])
+    parsed = {"items": [_item("계란", 500)], "total_amount": 500, "payment_method": "카드"}  # VLM 이 부모를 놓침
+    merged, corr = _merge_with(parsed, lines)
+    assert not any(c["reason"] == "sub_demoted" for c in corr)
+    assert any(i["name"] == "계란" for i in merged["items"])
+
+
+def test_demotion_keeps_the_options_the_vlm_hung_under_the_demoted_item():
+    lines = _opt_receipt([
+        ("메가치킨마요", 100, "7,800"),
+        ("+스팸1조각", 100, "1,700"),
+        ("토네이도소세지", 120, "2,100"),
+        ("+치킨1조각", 100, "1,600"),
+    ])
+    parsed = {
+        "items": [
+            _item("메가치킨마요", 7800, [{"name": "스팸1조각", "price": 1700}]),
+            _item("토네이도소세지", 2100, [{"name": "별도옵션", "price": 300}]),
+        ],
+        "total_amount": 11900, "payment_method": "카드",
+    }
+    merged, _ = _merge_with(parsed, lines)
+    assert "별도옵션" in [s["name"] for s in merged["items"][0]["sub_items"]]
+
+
+def test_one_syllable_marked_row_is_not_an_option():
+    lines = _opt_receipt([("순살해장국", 100, "12,500"), ("ㄴ콜", 100, None)])
+    parsed = {
+        "items": [_item("순살해장국", 12500, [{"name": "보통맛", "price": 0}])],
+        "total_amount": 12500, "payment_method": "카드",
+    }
+    merged, _ = _merge_with(parsed, lines)
+    assert [s["name"] for s in merged["items"][0]["sub_items"]] == ["보통맛"]
+
+
+def test_marked_negative_row_is_not_added_as_an_option():
+    lines = _opt_receipt([("국수", 100, "5,000"), ("-서비스음료", 100, "-500")])
+    parsed = {"items": [_item("국수", 5000, [{"name": "곱빼기", "price": 0}])],
+              "total_amount": 5000, "payment_method": "카드"}
+    merged, _ = _merge_with(parsed, lines)
+    assert merged["items"][0]["discount"] == 0
+    assert [s["name"] for s in merged["items"][0]["sub_items"]] == ["곱빼기"]
+
+
+def test_free_option_with_a_marker_is_recovered_when_the_vlm_missed_it():
+    lines = _opt_receipt([
+        ("순살해장국", 100, "12,500"),
+        ("ㄴ보통맛", 100, None),
+        ("ㄴ조리끓여서", 100, None),
+    ])
+    parsed = {"items": [_item("순살해장국", 12500)], "total_amount": 12500, "payment_method": "카드"}
+    merged, corr = _merge_with(parsed, lines)
+    subs = merged["items"][0]["sub_items"]
+    assert [(s["name"], s["price"]) for s in subs] == [("보통맛", 0), ("조리끓여서", 0)]
+    assert [c["reason"] for c in corr].count("option_recovered") == 2
+    assert merged["total_amount"] == 12500
+
+
+def test_free_option_is_not_added_twice_when_the_vlm_already_has_it():
+    lines = _opt_receipt([("순살해장국", 100, "12,500"), ("ㄴ보통맛", 100, None)])
+    parsed = {
+        "items": [_item("순살해장국", 12500, [{"name": "보통맛", "price": 0}])],
+        "total_amount": 12500, "payment_method": "카드",
+    }
+    merged, corr = _merge_with(parsed, lines)
+    assert [s["name"] for s in merged["items"][0]["sub_items"]] == ["보통맛"]
+    assert not any(c["reason"] == "option_recovered" for c in corr)
+
+
+def test_unmarked_indented_free_row_is_not_recovered_as_an_option():
+    lines = _opt_receipt([("순살해장국", 100, "12,500"), ("조리방법", 160, None)])
+    parsed = {"items": [_item("순살해장국", 12500)], "total_amount": 12500, "payment_method": "카드"}
+    merged, _ = _merge_with(parsed, lines)
+    assert merged["items"][0]["sub_items"] == []
+
+
+def test_marked_row_is_not_recovered_for_a_parent_matched_only_by_price():
+    # 이름 없는 금액 줄에 짝지어진 VLM 품목에는 기호 줄을 옵션으로 붙이지 않는다(오독 잔재일 수 있다)
+    lines = _opt_receipt([("", 100, "12,500"), ("ㄴ주문플랫폼정보", 100, None)])
+    parsed = {"items": [_item("순살해장국", 12500)], "total_amount": 12500, "payment_method": "카드"}
+    merged, _ = _merge_with(parsed, lines)
+    assert merged["items"][0]["sub_items"] == []
+
+
+def test_demoted_option_goes_to_the_exact_parent_not_a_longer_name():
+    """`김밥` 이 `참치김밥` 에 걸려 옵션이 잘못된 부모로 가면 안 된다."""
+    lines = _opt_receipt([
+        ("김밥", 100, "3,000"),
+        ("참치김밥", 100, "4,000"),
+        ("+치즈추가", 100, "500"),
+    ])
+    # 옵션은 참치김밥 것이다. VLM 이 그 옵션을 최상위로 올렸다.
+    parsed = {
+        "items": [_item("김밥", 3000), _item("참치김밥", 4000), _item("치즈추가", 500)],
+        "total_amount": 7500, "payment_method": "카드",
+    }
+    merged, _ = _merge_with(parsed, lines)
+    by_name = {i["name"]: [s["name"] for s in i["sub_items"]] for i in merged["items"]}
+    assert by_name == {"김밥": [], "참치김밥": ["치즈추가"]}
+
+
+def test_paid_option_the_vlm_named_differently_is_not_counted_twice():
+    lines = _opt_receipt([("메가치킨마요", 100, "7,800"), ("+스팸1조각", 100, "1,700")])
+    parsed = {
+        "items": [_item("메가치킨마요", 7800, [{"name": "햄 추가", "price": 1700}])],
+        "total_amount": 9500, "payment_method": "카드",
+    }
+    merged, corr = _merge_with(parsed, lines)
+    assert [s["name"] for s in merged["items"][0]["sub_items"]] == ["햄 추가"]
+    assert not any(c["reason"] == "option_recovered" for c in corr)
+
+
+def test_weak_marker_row_is_recovered_only_when_the_vlm_read_an_option_of_that_item():
+    rows = [("순살해장국", 100, "12,500"), ("-리뷰이벤트참여", 100, None)]
+    parsed = {"items": [_item("순살해장국", 12500)], "total_amount": 12500, "payment_method": "카드"}
+    merged, _ = _merge_with(parsed, _opt_receipt(rows))
+    assert merged["items"][0]["sub_items"] == []  # VLM 은 옵션을 안 읽었다 — 안내문일 수 있다
+    parsed = {"items": [_item("순살해장국", 12500, [{"name": "보통맛", "price": 0}])],
+              "total_amount": 12500, "payment_method": "카드"}
+    merged, _ = _merge_with(parsed, _opt_receipt(rows))
+    assert [s["name"] for s in merged["items"][0]["sub_items"]] == ["보통맛", "리뷰이벤트참여"]
+
+
+def test_option_indent_thresholds_sandwiched_rows_need_a_third_of_a_char_and_others_more():
+    # 기호 한 글자(20px)의 절반쯤(8px) 안쪽: 앞뒤가 옵션이면 옵션, 아니면 품목
+    rows = [("김밥", 100, "3,000"), ("+치즈추가", 100, "500"), ("계란", 108, "500"), ("+소스추가", 100, "300")]
+    assert _subs(analyze_receipt(_opt_receipt(rows))) == [
+        ("김밥", [("치즈추가", 500), ("계란", 500), ("소스추가", 300)])]
+    rows = [("김밥", 100, "3,000"), ("+치즈추가", 100, "500"), ("라면", 108, "4,000")]
+    assert _subs(analyze_receipt(_opt_receipt(rows))) == [("김밥", [("치즈추가", 500)]), ("라면", [])]
+
+
+def test_demotion_does_not_duplicate_an_option_the_owner_already_has():
+    lines = _opt_receipt([("국수", 100, "5,000"), ("+계란추가", 100, "500"), ("라면", 100, "4,000")])
+    parsed = {
+        "items": [_item("국수", 5000, [{"name": "계란추가", "price": 500}]), _item("계란추가", 500), _item("라면", 4000)],
+        "total_amount": 9500, "payment_method": "카드",
+    }
+    merged, _ = _merge_with(parsed, lines)
+    noodle = next(i for i in merged["items"] if i["name"] == "국수")
+    assert [s["name"] for s in noodle["sub_items"]] == ["계란추가"]
+
+
+def test_indent_only_option_is_not_recovered_even_when_the_vlm_has_options():
+    lines = _opt_receipt([("순살해장국", 100, "12,500"), ("조리방법", 160, None)])
+    parsed = {"items": [_item("순살해장국", 12500, [{"name": "보통맛", "price": 0}])],
+              "total_amount": 12500, "payment_method": "카드"}
+    merged, _ = _merge_with(parsed, lines)
+    assert [s["name"] for s in merged["items"][0]["sub_items"]] == ["보통맛"]

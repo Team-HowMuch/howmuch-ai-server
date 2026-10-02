@@ -482,6 +482,46 @@ def _apply_layout(kept: list[dict], layout, ocr_texts: list[str], corrections: l
             remaining.append(s)
         v["sub_items"] = remaining
 
+    # 2b) 강등: VLM 이 최상위 품목으로 올린 줄이 좌표상 다른 품목의 하위 옵션이면 그 품목 아래로 내린다.
+    # 옵션 줄의 기호(`+`)를 VLM 이 놓치면 `토네이도소세지 1개 2,100` 이 독립 품목이 되어 품목 수와
+    # 하위목록이 틀어진다. 좌표가 같은 이름·금액을 최상위 품목으로도 읽었다면 모호하니 건드리지 않는다.
+    for v in list(kept):
+        price = _as_int(v.get("price"))
+        if price <= 0:
+            continue
+        if any(li.price == price and _names_match(v.get("name"), li.name) for li in layout_items):
+            continue
+        parent = next(
+            (
+                li
+                for li in layout_items
+                if li.name
+                and any(ls.price == price and _names_match(v.get("name"), ls.name) for ls in li.sub_items)
+            ),
+            None,
+        )
+        if parent is None:
+            continue
+        # 부모 품목은 같은 글자를 먼저 찾는다(`김밥` 옵션이 `참치김밥` 아래로 가면 안 된다)
+        owner = next((k for k in kept if k is not v and _same_hangul(k.get("name"), parent.name)), None) or next(
+            (k for k in kept if k is not v and _names_match(k.get("name"), parent.name)), None
+        )
+        if owner is None:
+            continue
+        subs_of_owner = owner.setdefault("sub_items", [])
+        if not any(_names_match(x.get("name"), v.get("name")) for x in subs_of_owner):
+            subs_of_owner.append({"name": v.get("name"), "price": price})
+        subs_of_owner.extend(v.get("sub_items") or [])
+        kept.remove(v)
+        corrections.append(
+            {
+                "field": "items",
+                "before": v.get("name") or "",
+                "after": f"{owner.get('name')} > {v.get('name')}",
+                "reason": "sub_demoted",
+            }
+        )
+
     # 3) 부착 + 복구
     # 이름 없는 좌표 품목(이름을 못 읽은 가격 줄)은 금액으로만 짝짓는다. 이름으로 이미 짝지어진
     # VLM 품목은 건너뛴다. 안 그러면 같은 금액의 다른 품목에 할인을 덮어쓴다.
@@ -551,6 +591,8 @@ def _apply_layout(kept: list[dict], layout, ocr_texts: list[str], corrections: l
                 matched["_layout_price"] = li.price  # 합계 검산에서 VLM 금액 대신 쓸 후보
             if subs and not matched.get("sub_items"):
                 matched["sub_items"] = subs
+            if li.name and _names_match(matched.get("name"), li.name):  # 이름까지 맞는 부모만(금액만 맞은 짝은 믿지 않는다)
+                _add_marked_subs(matched, li, kept, ocr_texts, corrections)
             # 할인은 좌표 기반 layout 만 안다. VLM 응답에는 할인 필드가 없다.
             if li.discount and not matched.get("discount"):
                 matched["discount"] = li.discount
@@ -596,6 +638,41 @@ def _apply_layout(kept: list[dict], layout, ocr_texts: list[str], corrections: l
     if any(not it.get("price") and id(it) not in claimed | taken_by_nameless for it in kept):
         return []
     return restorable
+
+
+def _add_marked_subs(matched: dict, li, kept: list[dict], ocr_texts: list[str], corrections: list) -> None:
+    """VLM 이 놓친 옵션을 좌표 줄에서 되살린다 — 이름 앞에 옵션 기호(`ㄴ`·`+`·`-`)가 찍힌 줄만.
+
+    0원 옵션(`ㄴ 보통맛`)은 금액 칸이 비어 있어 위의 `_layout_subs` 가 버린다. 기호가 찍혀 있으면 영수증이
+    직접 옵션이라고 말한 줄이므로 그 줄은 쓴다. 들여쓰기만으로 옵션이 된 줄은 오독 잔재일 수 있어 쓰지 않는다.
+    같은 이름이 이미 어느 품목·옵션에든 있으면 건드리지 않는다.
+    """
+    existing_subs = matched.get("sub_items") or []
+    for s in li.sub_items:
+        if not s.marked or len(re.sub(r"[^가-힣]", "", s.name or "")) < 2:
+            continue
+        if s.price is not None and s.price < 0:
+            continue
+        # `-`·`*`·`~`·`(선택)` 는 안내문 장식에도 쓰여, VLM 이 이 품목의 옵션을 이미 하나라도 읽었을 때만 믿는다
+        if not s.strong and not existing_subs:
+            continue
+        price = s.price or 0
+        # 금액이 있는 옵션을 VLM 이 다른 이름으로 이미 읽었으면(`스팸1조각` 을 `햄 추가` 로) 두 번 세지 않는다
+        if price > 0 and any(_as_int(x.get("price")) == price for x in matched.get("sub_items") or []):
+            continue
+        if any(
+            _names_match(x.get("name"), s.name)
+            for it in kept
+            for x in [it] + list(it.get("sub_items") or [])
+        ):
+            continue
+        res = _corrector.correct(s.name, ocr_texts)
+        name = res.corrected if res.changed else s.name
+        matched.setdefault("sub_items", []).append({"name": name, "price": price})
+        corrections.append(
+            {"field": "item.sub_items", "before": f"{matched.get('name')} > (VLM 누락)", "after": name,
+             "reason": "option_recovered"}
+        )
 
 
 # 영수증 품목 앞에 찍힌 줄 번호(`001 몬스터…`, `01 국산…`, `005 )ABC…`)
