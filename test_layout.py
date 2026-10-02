@@ -1375,3 +1375,203 @@ def test_partial_waiver_in_same_list_is_netted_not_item_discount():
     assert merged["items"][0]["discount"] == 0
     assert merged["delivery_fee"] == 2000
     assert server_identity(merged) == 11000
+
+
+# ---------------------------------------------------------------- 기울어 찍힌 사진
+
+def _tilted(rows, slope):
+    """rows: [(y, [(텍스트, x), ...])]. 토큰 중심이 오른쪽일수록 slope 만큼 아래로 밀린 합성 OCR 줄.
+
+    실제로 기운 사진에서는 긴 토큰도 중심 기준으로 밀리므로 왼쪽 끝이 아니라 중심 x 로 민다.
+    """
+    out = []
+    for y, cells in rows:
+        for text, x in cells:
+            centre = x + max(20, 20 * len(text)) / 2
+            out.append(_line(text, x, round(y + centre * slope)))
+    return out
+
+
+def _tilted_receipt(slope, header=True):
+    rows = [(60, [("홈마트", 100)])]
+    if header:
+        rows.append((100, [("상품명", 100), ("단가", 400), ("금액", 560)]))
+    y = 130
+    for name, price in (("가나다", 1100), ("마바사", 2200), ("아자차", 3300), ("카타파", 4400), ("하하하", 5500)):
+        rows.append((y, [(name, 100)]))
+        rows.append((y + 24, [("8801234567890", 100), (f"{price:,}", 400), (f"{price:,}", 560)]))
+        y += 48
+    rows.append((y + 40, [("합계", 100), ("16,500", 560)]))
+    return _tilted(rows, slope)
+
+
+def _name_to_price(lines):
+    layout = analyze_receipt(lines)
+    return [(li.name, li.price) for li in layout.items]
+
+
+_EXPECTED_PAIRS = [("가나다", 1100), ("마바사", 2200), ("아자차", 3300), ("카타파", 4400), ("하하하", 5500)]
+
+
+def test_tilted_amounts_are_paired_with_their_own_names():
+    assert _name_to_price(_tilted_receipt(0.0)) == _EXPECTED_PAIRS
+    for slope in (0.03, 0.04, -0.03, -0.04):
+        assert _name_to_price(_tilted_receipt(slope)) == _EXPECTED_PAIRS, slope
+
+
+def test_tilt_below_the_threshold_leaves_tokens_untouched():
+    from layout import deskew
+
+    tokens = _to_tokens(_tilted_receipt(0.005))
+    assert deskew(tokens) is tokens
+
+
+def test_no_table_header_means_no_deskew():
+    """머리글을 못 찾으면 품목 구간이 어디서 끝나는지도 믿을 수 없어 기울기를 펴지 않는다."""
+    from layout import deskew
+
+    tokens = _to_tokens(_tilted_receipt(0.04, header=False))
+    assert deskew(tokens) is tokens
+
+
+def test_too_few_tokens_or_pairs_means_no_deskew():
+    from layout import deskew, estimate_skew
+
+    assert estimate_skew(_to_tokens([_line("가", 100, 100)] * 3)) == 0.0
+    sparse = _to_tokens(_HEADER + [_line("참치김밥", 100, 150), _line("3,500", 600, 150)])
+    assert estimate_skew(sparse) == 0.0
+    assert deskew(sparse) is sparse
+
+
+def test_absurd_tilt_is_not_trusted():
+    from layout import estimate_skew
+
+    assert estimate_skew(_to_tokens(_tilted_receipt(0.5))) == 0.0
+
+
+def test_deskew_does_not_touch_the_summary_rows():
+    from layout import deskew
+
+    tokens = _to_tokens(_tilted_receipt(0.04))
+    fixed = deskew(tokens)
+    totals = [(a, b) for a, b in zip(tokens, fixed) if a.text in ("합계", "16,500")]
+    assert totals and all(a is b for a, b in totals)
+
+
+def test_items_with_the_same_price_each_keep_their_own_discount():
+    """같은 금액(2,000원) 품목이 둘일 때 뒤 품목의 할인이 앞 품목에 붙어 사라지던 버그."""
+    lines = _HEADER + [
+        _line("콜라", 100, 150), _line("2,000", 600, 150),
+        _line("-400", 600, 190),
+        _line("사이다", 100, 230), _line("2,000", 600, 230),
+        _line("-400", 600, 270),
+        _line("합계", 100, 330), _line("3,200", 600, 330),
+    ]
+    parsed = {
+        "items": [
+            {"name": "콜라", "quantity": 1, "price": 2000, "sub_items": []},
+            {"name": "사이다", "quantity": 1, "price": 2000, "sub_items": []},
+        ],
+        "total_amount": 3200, "payment_method": "카드",
+    }
+    merged, _ = _merge_with(parsed, lines)
+    assert [(i["name"], i["discount"]) for i in merged["items"]] == [("콜라", 400), ("사이다", 400)]
+    assert merged["discount"] == 0
+
+
+def _chain(points):
+    """(텍스트, x, y) 목록을 OCR 줄로. 토큰 폭은 글자 수 x 20px."""
+    return [_line(text, x, y) for text, x, y in points]
+
+
+def test_skew_needs_the_consistent_pairs_to_be_a_real_share_of_all_pairs():
+    """같은 기울기를 말하는 쌍이 5개 넘어도 전체 쌍의 대부분이 제각각이면 우연이다."""
+    from layout import estimate_skew
+
+    pts = []
+    for row in range(7):  # 기울기가 같은(dy=6) 쌍 7개
+        y = 100 + row * 100
+        pts += [("가나", 100, y), ("다라", 220, y + 6)]
+    for row, dy in enumerate([d for d in range(-14, 15) if not 3 <= d <= 9 for _ in range(2)]):
+        y = 1000 + row * 100  # dy 가 제각각인 쌍
+        pts += [("마바", 100, y), ("사아", 220, y + dy)]
+    from layout import _to_tokens
+
+    assert estimate_skew(_to_tokens(_chain(pts))) == 0.0
+    # 같은 7쌍만 있으면 믿는다
+    assert estimate_skew(_to_tokens(_chain(pts[:14]))) > 0.015
+
+
+def test_skew_steeper_than_a_phone_photo_could_be_is_not_trusted():
+    """짧은 토큰 쌍은 가파른 기울기(약 14도)도 같은 줄로 보이게 한다. 그 정도는 줄 구조를 못 믿는다."""
+    from layout import _to_tokens, estimate_skew
+
+    pts = []
+    for row in range(6):
+        y = 100 + row * 100
+        pts += [("가나", 100, y), ("다라", 200, y + 24)]
+    assert estimate_skew(_to_tokens(_chain(pts))) == 0.0
+
+
+def test_skew_needs_at_least_eight_tokens_even_if_the_pairs_agree():
+    from layout import _to_tokens, estimate_skew
+
+    pts = [("가나", 100 + 160 * i, 100 + 5 * i) for i in range(7)]  # 한 줄 7토큰, 기울기 0.031
+    assert estimate_skew(_to_tokens(_chain(pts))) == 0.0
+    pts.append(("가나", 100 + 160 * 7, 100 + 5 * 7))
+    assert estimate_skew(_to_tokens(_chain(pts))) > 0.02
+
+
+def test_same_priced_items_are_matched_by_name_before_price():
+    """금액이 같은 품목이 둘일 때, 이름이 흐린 줄이 이름이 맞는 다른 품목을 가로채면 할인이 뒤바뀐다."""
+    lines = _HEADER + [
+        _line("가나다라", 100, 150), _line("2,000", 600, 150), _line("-400", 600, 190),  # VLM 의 '치즈버거' (이름이 깨짐)
+        _line("콜라세트", 100, 230), _line("2,000", 600, 230), _line("-700", 600, 270),
+        _line("합계", 100, 330), _line("2,900", 600, 330),
+    ]
+    parsed = {
+        "items": [  # 순서가 뒤바뀐 채 온다: 이름이 맞는 품목이 앞에 있다
+            {"name": "콜라세트", "quantity": 1, "price": 2000, "sub_items": []},
+            {"name": "치즈버거", "quantity": 1, "price": 2000, "sub_items": []},
+        ],
+        "total_amount": 2900, "payment_method": "카드",
+    }
+    merged, _ = _merge_with(parsed, lines)
+    assert {i["name"]: i["discount"] for i in merged["items"]} == {"콜라세트": 700, "치즈버거": 400}
+    assert merged["discount"] == 0
+
+
+def test_exact_name_is_matched_before_a_name_that_merely_contains_it():
+    """`우동` 줄의 할인이 앞에 있는 `김치우동` 으로 가면 안 된다."""
+    lines = _HEADER + [
+        _line("우동", 100, 150), _line("5,000", 600, 150), _line("-500", 600, 190),
+        _line("김치우동", 100, 230), _line("6,000", 600, 230),
+        _line("합계", 100, 330), _line("10,500", 600, 330),
+    ]
+    parsed = {
+        "items": [
+            {"name": "김치우동", "quantity": 1, "price": 6000, "sub_items": []},
+            {"name": "우동", "quantity": 1, "price": 5000, "sub_items": []},
+        ],
+        "total_amount": 10500, "payment_method": "카드",
+    }
+    merged, _ = _merge_with(parsed, lines)
+    assert {i["name"]: i["discount"] for i in merged["items"]} == {"김치우동": 0, "우동": 500}
+
+
+def test_blurry_line_is_not_restored_while_a_vlm_item_has_no_price():
+    """VLM 이 금액을 못 읽은 품목이 있으면, 흐린 줄은 그 품목일 수 있어 따로 되살리지 않는다."""
+    lines = _HEADER + [
+        _line("새우깡", 100, 150), _line("1,000", 600, 150),
+        _line("가나다라", 100, 190, conf=0.5), _line("2,000", 600, 190),
+        _line("합계", 100, 330), _line("3,000", 600, 330),
+    ]
+    parsed = {
+        "items": [
+            {"name": "새우깡", "quantity": 1, "price": 1000, "sub_items": []},
+            {"name": "마라탕면", "quantity": 1, "price": None, "sub_items": []},
+        ],
+        "total_amount": 3000, "payment_method": "카드",
+    }
+    merged, _ = _merge_with(parsed, lines)
+    assert [i["name"] for i in merged["items"]].count("가나다라") == 0

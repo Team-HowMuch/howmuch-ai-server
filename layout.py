@@ -11,6 +11,7 @@ PP-OCR이 주는 box 좌표로 다음을 복원한다.
 
 들여쓰기는 한국 영수증에서 드물어 보조 신호로만 쓴다(문자 폭 단위 정규화).
 """
+import math
 import re
 from dataclasses import dataclass, field
 from statistics import median
@@ -220,6 +221,86 @@ def _to_tokens(ocr_lines: list[dict]) -> list[Token]:
     return tokens
 
 
+# 기울기 보정: 같은 줄에서 옆에 붙은 토큰 쌍의 기울기 중 가장 촘촘히 몰린 값을 쓴다.
+_SKEW_MIN_DX = 80.0  # 이보다 가까운 두 토큰은 기울기를 재기엔 너무 짧다(px)
+_SKEW_BANDWIDTH = 0.008  # 같은 기울기로 볼 허용 오차(tan, 약 0.46도)
+_SKEW_MIN_SUPPORT = 5  # 이 기울기를 말하는 쌍이 이만큼은 있어야 믿는다
+_SKEW_MIN_SHARE = 0.25  # 그리고 전체 쌍의 이 비율 이상이어야 한다
+_SKEW_MIN_DEG = 0.8  # 이보다 덜 기울면 손대지 않는다
+_SKEW_MAX_DEG = 12.0  # 이보다 많이 기울었다면 줄 단위 구조를 믿을 수 없다
+
+
+def estimate_skew(tokens: list[Token]) -> float:
+    """사진이 기운 정도를 tan 값으로 돌려준다(오른쪽이 아래로 내려가면 양수). 못 믿으면 0.
+
+    영수증 한 줄은 OCR 이 바코드·단가·금액처럼 여러 토큰으로 쪼개는데, 기운 사진에서는
+    그 토큰들의 y 중심이 오른쪽으로 갈수록 한쪽으로 밀린다. 그래서 줄 묶기가 오른쪽 금액을
+    아래 줄 이름에 붙인다. 줄 간격이 20px 안팎일 때 기울기 1.6도만 돼도 금액 칸이 8px 밀려,
+    "이름 줄은 위, 금액 줄은 아래" 패턴이 한 줄씩 어긋난다.
+    """
+    if len(tokens) < 8:
+        return 0.0
+    height = median(t.height for t in tokens)
+    ordered = sorted(tokens, key=lambda t: (t.x1 + t.x2) / 2)
+    slopes: list[float] = []
+    for i, a in enumerate(ordered):
+        ax = (a.x1 + a.x2) / 2
+        best: tuple[float, float] | None = None
+        for b in ordered[i + 1:]:
+            bx = (b.x1 + b.x2) / 2
+            if b.x1 < a.x2 - 0.2 * height or b.x1 - a.x2 > 4.0 * height or bx - ax < _SKEW_MIN_DX:
+                continue
+            dy = abs(b.y_center - a.y_center)
+            if dy > 0.5 * min(a.height, b.height) + 0.1 * (bx - ax):
+                continue
+            if best is None or dy < best[0]:
+                best = (dy, (b.y_center - a.y_center) / (bx - ax))
+        if best is not None:
+            slopes.append(best[1])
+    if len(slopes) < _SKEW_MIN_SUPPORT:
+        return 0.0
+    support, centre = 0, 0.0
+    for candidate in slopes:
+        members = [s for s in slopes if abs(s - candidate) <= _SKEW_BANDWIDTH]
+        if len(members) > support:
+            support, centre = len(members), median(members)
+    if support < _SKEW_MIN_SUPPORT or support < _SKEW_MIN_SHARE * len(slopes):
+        return 0.0
+    if not math.radians(_SKEW_MIN_DEG) <= abs(math.atan(centre)) <= math.radians(_SKEW_MAX_DEG):
+        return 0.0
+    return centre
+
+
+def deskew(tokens: list[Token]) -> list[Token]:
+    """품목 구간의 기울기를 펴서 같은 인쇄 줄의 토큰이 같은 y 에 오게 한다.
+
+    합계부는 건드리지 않는다. 합계부는 `합계 ····· 5,300` 처럼 라벨과 금액이 멀리 떨어진 줄이
+    많고 줄 간격이 넓어서, 기울기를 펴면 오히려 금액이 아래 줄 라벨에 붙는다(홈플러스 영수증 실측).
+    품목 구간은 `이름 → 바코드·수량·금액` 이 20px 간격으로 촘촘히 이어져 기울기에 가장 약하다.
+    안 기울었거나 품목 구간을 못 찾으면 그대로 돌려준다.
+    """
+    rows = group_rows(tokens)
+    start, end = _find_item_region(rows)
+    # 표 머리글(`상품명 단가 수량 금액`)을 찾았을 때만 한다. 못 찾으면 구간이 어디서 끝나는지도
+    # 믿을 수 없어서(`합 계` 라벨이 깨지면 합계 줄까지 품목 구간이 된다) 기울기를 펴지 않는다.
+    if start == 0 or end - start < 3:
+        return tokens
+    inside = {id(t) for row in rows[start:end] for t in row.tokens}
+    region = [t for t in tokens if id(t) in inside]
+    slope = estimate_skew(region)
+    if not slope:
+        return tokens
+    pivot = median((t.x1 + t.x2) / 2 for t in region)
+    shifted = []
+    for t in tokens:
+        if id(t) not in inside:
+            shifted.append(t)
+            continue
+        dy = ((t.x1 + t.x2) / 2 - pivot) * slope
+        shifted.append(Token(t.text, t.confidence, t.x1, t.y1 - dy, t.x2, t.y2 - dy))
+    return shifted
+
+
 def group_rows(tokens: list[Token]) -> list[Row]:
     """y중심 클러스터링으로 토큰을 줄 단위로 묶는다.
 
@@ -411,7 +492,7 @@ def _delivery_fee(rows: list[Row]) -> int | None:
 
 
 def analyze_receipt(ocr_lines: list[dict]) -> Layout:
-    tokens = _to_tokens(ocr_lines)
+    tokens = deskew(_to_tokens(ocr_lines))
     rows = group_rows(tokens)
     if not rows:
         return Layout(rows=[], items=[], total_amount=None)

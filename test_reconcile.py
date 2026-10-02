@@ -770,3 +770,217 @@ def test_item_with_unreadable_price_printed_separately_is_not_demoted():
         + [_line("콜라", 100, 260), _line("2,0O0", 600, 260)] + _row("합계", "10,900", 340) + _row("카드결제", "10,900", 380)
     merged, _ = _run({"items": [_it("불고기버거세트", 8900), _it("콜라", 2000)], "total_amount": 10900}, lines)
     assert [i["name"] for i in merged["items"]] == ["불고기버거세트", "콜라"]
+
+
+# ---------------------------------------------------------------- 빠진 품목 되살리기 (add_item)
+
+def _blurry_receipt(printed_total=12000, blurry_conf=0.7, blurry_name="흐린이름"):
+    """VLM 이 두 번째 품목을 빠뜨렸고, OCR 은 그 줄을 흐리게(신뢰도 낮게) 읽은 영수증."""
+    lines = _HEADER + [
+        _line("떡볶이", 100, 150), _line("5,000", 600, 150),
+        _line(blurry_name, 100, 200, conf=blurry_conf), _line("3,000", 600, 200),
+        _line("순대", 100, 250), _line("4,000", 600, 250),
+        _line("합계", 100, 300), _line(f"{printed_total:,}", 600, 300),
+        _line("카드결제", 100, 350), _line(f"{printed_total:,}", 600, 350),
+    ]
+    parsed = {
+        "items": [
+            {"name": "떡볶이", "quantity": 1, "price": 5000, "sub_items": []},
+            {"name": "순대", "quantity": 1, "price": 4000, "sub_items": []},
+        ],
+        "total_amount": printed_total,
+        "payment_method": "카드",
+    }
+    return parsed, lines
+
+
+def test_blurry_line_is_restored_when_the_printed_total_needs_it():
+    parsed, lines = _blurry_receipt()
+    merged, corrections = _merge_with(parsed, lines)
+    assert [(i["price"], i["discount"]) for i in merged["items"]] == [(5000, 0), (3000, 0), (4000, 0)]
+    assert merged["items"][1]["name"] == "흐린이름"  # 영수증 순서대로 끼워 넣는다
+    assert merged["total_verified"] is True and merged["items_verified"] is True
+    assert [c["reason"] for c in corrections if c["field"] == "items"] == ["ocr_recovered"]
+
+
+def test_blurry_line_is_not_restored_when_the_total_already_balances():
+    """합계가 이미 맞으면 흐린 줄은 중복 읽기일 수 있다. 되살리지 않는다."""
+    parsed, lines = _blurry_receipt(printed_total=9000)
+    merged, corrections = _merge_with(parsed, lines)
+    assert [i["price"] for i in merged["items"]] == [5000, 4000]
+    assert "ocr_recovered" not in _reasons(corrections)
+
+
+def test_blurry_line_is_not_restored_when_it_still_would_not_balance():
+    """되살려도 합계가 안 맞으면(다른 품목도 빠졌다) 추측으로 채우지 않는다."""
+    parsed, lines = _blurry_receipt(printed_total=14000)
+    merged, corrections = _merge_with(parsed, lines)
+    assert [i["price"] for i in merged["items"]] == [5000, 4000]
+    assert merged["items_verified"] is False
+    assert "ocr_recovered" not in _reasons(corrections)
+
+
+def test_a_name_with_fewer_than_two_hangul_syllables_is_never_restored():
+    """한글이 한 글자뿐인 흐린 이름(`가`, `a가1`)은 이름이라 하기 어렵다. 되살리지 않는다."""
+    for name in ("가", "a가1"):
+        parsed, lines = _blurry_receipt(blurry_name=name)
+        merged, _ = _merge_with(parsed, lines)
+        assert [i["price"] for i in merged["items"]] == [5000, 4000], name
+
+
+def test_blurry_line_with_a_discount_is_restored_with_its_discount():
+    """되살린 품목의 할인은 영수증 단위 할인으로 이미 센 것이라, 품목으로 옮기면 전체 할인이 그만큼 준다."""
+    lines = _HEADER + [
+        _line("떡볶이", 100, 150), _line("5,000", 600, 150),
+        _line("흐린이름", 100, 200, conf=0.7), _line("3,000", 600, 200),
+        _line("-500", 600, 240),
+        _line("순대", 100, 280), _line("4,000", 600, 280),
+        _line("할인금액", 100, 330), _line("-500", 600, 330),
+        _line("합계", 100, 380), _line("11,500", 600, 380),
+        _line("카드결제", 100, 430), _line("11,500", 600, 430),
+    ]
+    parsed = {
+        "items": [
+            {"name": "떡볶이", "quantity": 1, "price": 5000, "sub_items": []},
+            {"name": "순대", "quantity": 1, "price": 4000, "sub_items": []},
+        ],
+        "total_amount": 11500, "payment_method": "카드",
+    }
+    merged, _ = _merge_with(parsed, lines)
+    assert [(i["price"], i["discount"]) for i in merged["items"]] == [(5000, 0), (3000, 500), (4000, 0)]
+    assert merged["discount"] == 0
+    assert rec.computed_total(merged["items"], merged["discount"], merged["delivery_fee"]) == 11500
+    assert merged["items_verified"] is True
+
+
+def test_restore_never_uses_a_total_only_the_vlm_claims():
+    """결제액이 영수증에 찍혀 있지 않으면 품목을 지어내서 VLM 합계에 맞추지 않는다."""
+    parsed, lines = _blurry_receipt()
+    lines = [l for l in lines if l["text"] not in ("합계", "12,000", "카드결제")]
+    merged, corrections = _merge_with(parsed, lines)
+    assert [i["price"] for i in merged["items"]] == [5000, 4000]
+    assert "ocr_recovered" not in _reasons(corrections)
+
+
+def test_two_blurry_lines_can_be_restored_together_but_not_three():
+    lines = _HEADER + [
+        _line("김치볶음밥", 100, 150, conf=0.7), _line("1,000", 600, 150),
+        _line("된장찌개정식", 100, 200, conf=0.7), _line("2,000", 600, 200),
+        _line("불고기덮밥", 100, 250, conf=0.7), _line("4,000", 600, 250),
+        _line("치즈돈까스", 100, 300), _line("8,000", 600, 300),
+        _line("합계", 100, 350), _line("15,000", 600, 350),
+        _line("카드결제", 100, 400), _line("15,000", 600, 400),
+    ]
+
+    def run(vlm_items):
+        parsed = {"items": [dict(name=n, quantity=1, price=p, sub_items=[]) for n, p in vlm_items],
+                  "total_amount": 15000, "payment_method": "카드"}
+        return _merge_with(parsed, [dict(l) for l in lines])[0]
+
+    two_missing = run([("불고기덮밥", 4000), ("치즈돈까스", 8000)])
+    assert [i["price"] for i in two_missing["items"]] == [1000, 2000, 4000, 8000]  # 영수증 순서
+    assert two_missing["items_verified"] is True
+    three_missing = run([("치즈돈까스", 8000)])
+    assert [i["price"] for i in three_missing["items"]] == [8000]  # 셋을 한꺼번에 지어내진 않는다
+
+
+def test_restore_edit_cost_is_between_discounts_and_deletions():
+    assert rec._ADD_ITEM_COST > 1.0
+    assert rec._ADD_ITEM_COST < 1.5
+
+
+def test_restore_consistency_checks_the_real_total_after_restoring():
+    """합산 추정(가 5,000 + 나 3,000 = 8,000)과 실제(나는 500 할인돼 2,500)가 다르면 해를 버린다."""
+    items = [{"name": "가", "price": 5000, "discount": 0, "sub_items": []}]
+    restorable = [{"name": "나", "price": 3000, "discount": 500, "_pos": 1}]
+    combo = (rec.Edit("add_item", 1.3, amount=3000, ref=0),)
+    # 전체 할인이 없을 때: 품목 할인 500 이 그대로 합계를 깎아 실제 합계는 7,500
+    assert not rec._restore_consistent(items, 0, 0, combo, restorable, 8000)
+    assert rec._restore_consistent(items, 0, 0, combo, restorable, 7500)
+    # 전체 할인 500 이 이미 있으면 그 500 이 품목 할인으로 옮겨 갈 뿐이라 합계는 여전히 7,500
+    assert rec._restore_consistent(items, 500, 0, combo, restorable, 7500)
+    assert not rec._restore_consistent(items, 500, 0, combo, restorable, 8000)
+
+
+def test_restore_is_offered_only_if_the_receipt_wide_discount_can_absorb_its_discount():
+    from collections import Counter
+
+    items = [{"name": "가", "price": 5000, "discount": 0, "sub_items": []}]
+    restorable = [{"name": "나", "price": 3000, "discount": 500, "_pos": 1}]
+    kinds = lambda discount: [e.kind for e in rec._candidate_edits(items, rec.Evidence(), set(), Counter(),
+                                                                    discount, restorable)]
+    assert "add_item" not in kinds(0)
+    assert "add_item" in kinds(500)
+
+
+def test_no_private_keys_leak_after_restoring():
+    parsed, lines = _blurry_receipt()
+    merged, _ = _merge_with(parsed, lines)
+    assert "_restorable" not in merged
+    assert all(not k.startswith("_") for i in merged["items"] for k in i)
+
+
+def test_restoring_two_items_is_rejected_when_their_discounts_exceed_the_receipt_wide_discount():
+    """각각은 전체 할인(500)에 흡수되지만(300 ≤ 500) 둘을 함께 되살리면(600) 넘친다. 합산 추정이 틀린다."""
+    from collections import Counter
+
+    items = [{"name": "가", "price": 5000, "discount": 0, "sub_items": []}]
+    restorable = [
+        {"name": "나", "price": 2000, "discount": 300, "_pos": 1},
+        {"name": "다", "price": 3000, "discount": 300, "_pos": 2},
+    ]
+    ev = rec.Evidence()
+    # 합산 추정: 5000 - 500 + 2000 + 3000 = 9500. 실제로는 5000 + 1700 + 2700 = 9400
+    assert rec.solve(items, 500, 0, [rec.Candidate(9500, 0)], ev, Counter(), restorable) is None
+    solution = rec.solve(items, 500, 0, [rec.Candidate(9400, 0)], ev, Counter(), restorable)
+    assert solution is None  # 합산 추정(9500)과 맞지 않는 값은 후보 수정 조합으로 만들 수 없다
+
+
+# ---------------------------------------------------------------- add_item 후보 거르기
+
+def _restore_case(restorable, items=None):
+    from reconcile import Evidence, solve, Candidate
+    from collections import Counter
+
+    items = items if items is not None else [{"name": "과자", "quantity": 1, "price": 1000, "sub_items": [], "discount": 0}]
+    ev = Evidence()
+    return solve(items, 0, 0, [Candidate(3000, 0)], ev, Counter(), restorable)
+
+
+def _cand(name, price):
+    return {"name": name, "quantity": 1, "price": price, "discount": 0, "_pos": 5}
+
+
+def test_restore_offers_a_plain_product_line():
+    sol = _restore_case([_cand("새우깡", 2000)])
+    assert sol is not None and [e.kind for e in sol.edits] == ["add_item"]
+
+
+def test_restore_never_offers_header_delivery_or_payment_lines():
+    for name in ("상품명 수량 금액", "배달팁", "카드결제", "할인쿠폰", "합계금액"):
+        assert _restore_case([_cand(name, 2000)]) is None, name
+
+
+def test_restore_never_offers_a_summary_amount():
+    from reconcile import Evidence, solve, Candidate
+    from collections import Counter
+
+    items = [{"name": "과자", "quantity": 1, "price": 1000, "sub_items": [], "discount": 0}]
+    ev = Evidence()
+    ev.summary = {2000}
+    assert solve(items, 0, 0, [Candidate(3000, 0)], ev, Counter(), [_cand("새우깡", 2000)]) is None
+
+
+def test_restore_two_different_lines_that_both_fit_is_ambiguous():
+    assert _restore_case([_cand("새우깡", 2000), _cand("감자깡", 2000)]) is None
+
+
+def test_restore_never_offers_a_label_like_name_outside_the_word_list():
+    # `거자이체`(`이체` = 계좌이체 라벨) 는 헤더·배달 어휘는 아니지만 품목이 아니다
+    assert _restore_case([_cand("거자이체", 2000)]) is None
+
+
+def test_restore_item_discount_larger_than_the_receipt_discount_is_not_offered():
+    cand = dict(_cand("새우깡", 2500), discount=500)
+    # 2500 - 500 = 2000 이 더해져야 3000 이 되지만, 할인 500 이 영수증 할인 0 에 이미 들어 있지 않다
+    assert _restore_case([cand]) is None

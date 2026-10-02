@@ -15,6 +15,7 @@ import re
 import tempfile
 import threading
 import time
+from datetime import date as _date, datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from pathlib import Path
@@ -320,6 +321,11 @@ def _names_match(a: str | None, b: str | None) -> bool:
     return _jamo_distance(na, nb) <= max(2, len(_jamo_seq(na)) // 3)
 
 
+def _same_hangul(a: str | None, b: str | None) -> bool:
+    na = re.sub(r"[^가-힣]", "", a or "")
+    return bool(na) and na == re.sub(r"[^가-힣]", "", b or "")
+
+
 def _correct_name(item: dict, key: str, field_name: str, ocr_texts: list[str], corrections: list):
     name = item.get(key)
     if not name:
@@ -487,17 +493,42 @@ def _apply_layout(kept: list[dict], layout, ocr_texts: list[str], corrections: l
         if _names_match(it.get("name"), li.name)
     }
     taken_by_nameless: set[int] = set()
-    for li in layout_items:
+    claimed: set[int] = set()  # 이미 어떤 좌표 품목의 짝이 된 VLM 품목
+    restorable: list[dict] = []  # 이름 신뢰도가 낮아 바로 복구하진 않지만 합계 검산이 쓸 수 있는 줄
+    numbered = _has_line_numbers(layout_items)
+    for pos, li in enumerate(layout_items):
         if li.name:
+            # 이름이 맞는 품목을 먼저 찾는다. 금액만 같은 품목을 먼저 집으면 같은 금액의 품목이
+            # 여럿일 때(`2,000원` 이 셋) 앞 품목이 뒤 품목의 할인까지 가져가고 뒤 품목은 할인을 잃는다.
+            # 같은 글자의 품목을 포함 관계만 있는 품목(`우동` ⊂ `김치우동`)보다 먼저 집는다.
             matched = next(
-                (
-                    it
-                    for it in kept
-                    if _names_match(it.get("name"), li.name)
-                    or (li.price is not None and it.get("price") == li.price)
-                ),
+                (it for it in kept if id(it) not in claimed and _same_hangul(it.get("name"), li.name)),
+                None,
+            ) or next(
+                (it for it in kept if id(it) not in claimed and _names_match(it.get("name"), li.name)),
                 None,
             )
+            if matched is None:
+                matched = next(
+                    (
+                        it
+                        for it in kept
+                        if li.price is not None
+                        and it.get("price") == li.price
+                        and id(it) not in claimed
+                        and id(it) not in named_matches
+                    ),
+                    None,
+                )
+            if matched is None:
+                # 짝이 이미 다른 줄에 쓰였더라도 같은 품목의 다른 줄일 수 있다. 한 품목이 좌표 줄 둘로
+                # 읽히는 영수증이 있고(이름이 줄바꿈된 배달앱 전표), 둘째 줄의 하위 옵션·할인·중복 방지가
+                # 여기에 달려 있다. 이름이 맞는 품목을 먼저, 없으면 금액이 같은 품목을 쓴다(기존 동작).
+                matched = next((it for it in kept if _names_match(it.get("name"), li.name)), None)
+            if matched is None and li.price is not None:
+                matched = next((it for it in kept if it.get("price") == li.price), None)
+            if matched is not None:
+                claimed.add(id(matched))
         else:
             matched = next(
                 (
@@ -515,6 +546,7 @@ def _apply_layout(kept: list[dict], layout, ocr_texts: list[str], corrections: l
 
         subs = _layout_subs(li)
         if matched is not None:
+            matched.setdefault("_pos", pos)  # 영수증에 찍힌 순서(복구한 품목을 제자리에 넣을 때 쓴다)
             if li.price is not None and li.price > 0 and _names_match(matched.get("name"), li.name):
                 matched["_layout_price"] = li.price  # 합계 검산에서 VLM 금액 대신 쓸 후보
             if subs and not matched.get("sub_items"):
@@ -526,15 +558,24 @@ def _apply_layout(kept: list[dict], layout, ocr_texts: list[str], corrections: l
             continue
 
         # VLM이 놓친 품목 복구: 좌표상 품목 영역에서 이름+금액이 확실한 줄만
-        if (
-            li.name is None
-            or li.price is None
-            or li.name_confidence < 0.8
-            or len(re.sub(r"[^가-힣]", "", li.name)) < 2
-        ):
+        if li.name is None or li.price is None or len(re.sub(r"[^가-힣]", "", li.name)) < 2:
             continue
         res = _corrector.correct(li.name, ocr_texts)
         name = res.corrected if res.changed else li.name
+        if li.name_confidence < 0.8:
+            # 이름이 흐려 이 줄만 믿고 되살리진 않는다. 합계 검산이 "이 줄이 있어야만 합계가 맞는다" 고
+            # 말할 때만 쓰도록 후보로 남긴다(reconcile 의 add_item). 0원 줄은 합계를 못 메우니 후보가 아니다.
+            if li.price > 0:
+                restorable.append(
+                    {
+                        "name": _strip_line_number(name) if numbered else name,
+                        "quantity": li.quantity,
+                        "price": li.price,
+                        "discount": li.discount,
+                        "_pos": pos,
+                    }
+                )
+            continue
         kept.append(
             {
                 "name": name,
@@ -544,11 +585,41 @@ def _apply_layout(kept: list[dict], layout, ocr_texts: list[str], corrections: l
                 "discount": li.discount,
                 "_discount_amounts": list(li.discount_amounts),
                 "_src": "ocr",  # 합계 검산에서 VLM 품목보다 먼저 의심한다
+                "_pos": pos,
             }
         )
         corrections.append(
             {"field": "items", "before": "(VLM 누락)", "after": name, "reason": "ocr_recovered"}
         )
+    # VLM 이 금액을 못 읽은 품목이 있는데 어느 좌표 줄과도 짝이 안 되었다면, 그 품목이 흐리게 읽힌 줄일 수
+    # 있다. 그 줄을 따로 되살리면 같은 품목이 두 번 들어가므로 되살리지 않는다.
+    if any(not it.get("price") and id(it) not in claimed | taken_by_nameless for it in kept):
+        return []
+    return restorable
+
+
+# 영수증 품목 앞에 찍힌 줄 번호(`001 몬스터…`, `01 국산…`, `005 )ABC…`)
+_LINE_NUMBER = re.compile(r"^(\d{1,3})\s*[*.)\-]*\s*(?=[^\d\s])")
+
+
+def _has_line_numbers(layout_items) -> bool:
+    """품목 이름 앞에 순번이 차례로 찍힌 영수증인가. 상품명 자체가 숫자로 시작하는 경우(`7UP`)와 구분한다."""
+    numbers = []
+    for li in layout_items:
+        match = _LINE_NUMBER.match((li.name or "").strip())
+        if match:
+            numbers.append(int(match.group(1)))
+    return (
+        len(numbers) >= 3
+        and numbers == sorted(numbers)
+        and len(set(numbers)) == len(numbers)
+        and len(numbers) >= 0.6 * sum(1 for li in layout_items if li.name)
+    )
+
+
+def _strip_line_number(name: str) -> str:
+    stripped = _LINE_NUMBER.sub("", (name or "").strip(), count=1)
+    return stripped or name
 
 
 # VLM이 값을 못 찾을 때 프롬프트 예시를 그대로 돌려주는 경우
@@ -590,6 +661,147 @@ def _drop_invented_midnight(parsed: dict, ocr_lines: list[dict], corrections: li
     corrections.append(
         {"field": "purchased_at", "before": value, "after": match.group(1), "reason": "invented_time"}
     )
+
+
+# 영수증에 찍힌 날짜. 연도는 4자리(2026/05/31) 또는 2자리(26-07-01), 구분자는 - / . 이다.
+# OCR 이 날짜와 시각 사이 공백을 떨어뜨려 `26-07-0118:47` 처럼 붙여 읽는 일이 잦다.
+_PRINTED_DATE = re.compile(
+    r"(?<![\d])(\d{4}|\d{2})\s*[-/.]\s*(\d{1,2})\s*[-/.]\s*(\d{2})(?:(?!\d)|(?=\d{1,2}\s*:\s*\d{2}))"
+    r"\s*(?:(\d{1,2})\s*:\s*(\d{2})(?!\d))?"
+    r"|(?<![\d])(\d{4}|\d{2})\s*[-/.]\s*(\d{1,2})\s*[-/.]\s*(\d{1})(?!\d)"
+)
+# 날짜 줄의 라벨. OCR 이 `판매일` 을 `판매입` 으로 읽는 일이 있어 받침이 다른 글자도 받는다.
+_DATE_LABEL = re.compile(r"판\s*매\s*[일입]|거\s*래\s*[일입]|[일입]\s*시(?!\s*불)|결\s*제\s*[일입]|주\s*문\s*[일입]|"
+                         r"승\s*인\s*[일입]|날\s*짜|발\s*행\s*[일입]|구\s*매\s*[일입]|DATE|Date")
+
+
+# 날짜 줄에 같이 찍힌 요일: `수요일`, `[일]`, `(수)`
+_PRINTED_WEEKDAY = re.compile(r"([월화수목금토일])\s*요\s*일|[\[(]\s*([월화수목금토일])\s*[\])]")
+_WEEKDAYS = "월화수목금토일"  # date.weekday() 순서(월=0)
+
+
+def _today() -> _date:
+    return datetime.now().date()
+
+
+def _printed_dates(ocr_lines: list[dict], today: _date | None = None) -> list[tuple[str, str | None, bool, bool]]:
+    """OCR 줄에서 읽은 (YYYY-MM-DD, HH:MM 또는 None, 라벨이 붙은 줄인가, 요일이 맞게 찍혔는가).
+
+    같은 줄에 요일이 찍혀 있는데 그 날짜의 요일과 다르면 OCR 이 숫자를 잘못 읽은 것이라 버린다
+    (`23-08-19 수요일` 은 토요일이다. 실제로는 `26-08-19`, OCR 이 6 을 3 으로 읽었다).
+    """
+    today = today or _today()
+    found: list[tuple[str, str | None, bool, bool]] = []
+    for line in ocr_lines:
+        if float(line.get("confidence") or 0) < 0.75:
+            continue
+        text = line.get("text") or ""
+        for m in _PRINTED_DATE.finditer(text):
+            if m.group(1):
+                yy, mo, dd, hh, mi = m.group(1), m.group(2), m.group(3), m.group(4), m.group(5)
+            else:
+                yy, mo, dd, hh, mi = m.group(6), m.group(7), m.group(8), None, None
+            year = int(yy) if len(yy) == 4 else 2000 + int(yy)
+            try:
+                day = _date(year, int(mo), int(dd))
+            except ValueError:
+                continue
+            # 먼 과거나 미래 날짜는 날짜가 아니라 다른 숫자(전화번호·승인번호)가 우연히 맞은 것이다
+            if not today - timedelta(days=366 * 8) <= day <= today + timedelta(days=1):
+                continue
+            weekday = _PRINTED_WEEKDAY.search(text)
+            weekday_ok = False
+            if weekday:
+                if (weekday.group(1) or weekday.group(2)) != _WEEKDAYS[day.weekday()]:
+                    continue
+                weekday_ok = True
+            clock = None
+            if hh is not None and 0 <= int(hh) <= 23 and 0 <= int(mi) <= 59:
+                clock = f"{int(hh):02d}:{mi}"
+            found.append((day.isoformat(), clock, bool(_DATE_LABEL.search(text)), weekday_ok))
+    return found
+
+
+def _vlm_date_is_printed(value: str, ocr_lines: list[dict]) -> bool:
+    """VLM 이 읽은 날짜가 OCR 줄 어딘가에 찍혀 있는가. 구분자(`년월일`·`,`·`~`)나 자릿수 표기는 가리지 않고,
+    신뢰도가 낮은 줄도 본다(여기서는 "있다" 쪽이 안전하다)."""
+    year, month, day = value[:4], int(value[5:7]), int(value[8:10])
+    sep = r"\s*\D{0,3}\s*"
+    end = r"(?:(?!\d)|(?=\d{1,2}\s*:\s*\d{2}))"  # 날짜 바로 뒤에 시각이 붙어 읽힌 것(`2026.08.0818:32`)도 받는다
+    pattern = re.compile(
+        rf"(?<!\d)(?:{year}|{year[2:]}){sep}0?{month}{sep}0?{day}{end}|(?<!\d){year}{month:02d}{day:02d}{end}"
+    )
+    return any(pattern.search(line.get("text") or "") for line in ocr_lines)
+
+
+def _clock_is_printed(clock: str, ocr_lines: list[dict]) -> bool:
+    """VLM 시각이 영수증에 찍혀 있는가. `오후 6:49` 처럼 12시간제로 찍힌 것도 같은 시각으로 본다."""
+    hour, minute = int(clock[:2]), clock[3:5]
+    hours = {hour}
+    if hour > 12:
+        hours.add(hour - 12)
+    elif hour in (0, 12):
+        hours.update((0, 12))
+    pattern = re.compile(rf"(?<!\d)0?(?:{'|'.join(str(h) for h in sorted(hours))})\s*:\s*{minute}(?!\d)")
+    return any(pattern.search(line.get("text") or "") for line in ocr_lines)
+
+
+def _one_digit_apart(a: str, b: str) -> bool:
+    return len(a) == len(b) and sum(x != y for x, y in zip(a, b)) == 1
+
+
+def _fix_date_from_ocr(parsed: dict, ocr_lines: list[dict], corrections: list, today: _date | None = None) -> None:
+    """VLM 이 읽은 날짜가 영수증 어디에도 없으면 OCR 이 읽은 날짜로 바로잡는다.
+
+    VLM 은 `26-07-01` 을 `2023-07-26` 처럼 숫자를 재배열하거나 연도를 지어내곤 한다. 인쇄된 숫자는 OCR 이
+    글자 그대로 읽으므로, VLM 날짜가 OCR 줄 어디에도 나오지 않을 때만 OCR 날짜를 쓴다. 후보가 둘 이상으로
+    갈리면(승인일과 판매일이 다른 전표 등) 손대지 않는다.
+    """
+    today = today or _today()
+    value = parsed.get("purchased_at")
+    if not isinstance(value, str) or not re.match(r"^\d{4}-\d{2}-\d{2}", value):
+        return
+    try:
+        _date(int(value[:4]), int(value[5:7]), int(value[8:10]))
+    except ValueError:
+        return
+    if _vlm_date_is_printed(value, ocr_lines):
+        return
+    printed = _printed_dates(ocr_lines, today)
+    if not printed:
+        return
+    labeled = [p for p in printed if p[2]]
+    pool = labeled or printed
+    days = {p[0] for p in pool}
+    if len(days) > 1:
+        # 후보가 갈리면, VLM 이 읽은 월·일과 같은 날이 하나뿐일 때만 그쪽(연도만 틀린 경우)을 고른다
+        same_md = {d for d in days if d[5:] == value[5:10]}
+        if len(same_md) != 1:
+            return
+        days = same_md
+        pool = [p for p in pool if p[0] in days]
+    day = next(iter(days))
+    weekday_ok = any(p[3] for p in pool if p[0] == day)
+    # 월·일은 같고 연도만 다르면 연도가 더 최근인 쪽을 쓴다. VLM 은 오래된 연도(2023)를 지어내는 쪽으로
+    # 치우치고, OCR 은 `26` 을 `23` 으로 읽는 일이 있어, 더 최근 연도가 맞을 가능성이 높다. 다만 VLM 연도가
+    # 미래면(오늘보다 뒤) 지어낸 값이라 이 규칙으로 감싸 주지 않는다.
+    vlm_day = _date(int(value[:4]), int(value[5:7]), int(value[8:10]))
+    if day[5:] == value[5:10] and day[:4] < value[:4] and vlm_day <= today + timedelta(days=1):
+        return
+    # 월·일이 한 글자만 다르고 요일로 확인되지도 않으면, OCR 이 한 글자를 잘못 읽었을 가능성이 VLM 이
+    # 그 날짜를 지어냈을 가능성만큼 크다. 어느 쪽도 믿지 않고 둔다.
+    if _one_digit_apart(day[5:].replace("-", ""), value[5:10].replace("-", "")) and not weekday_ok:
+        return
+    clocks = {p[1] for p in pool if p[1] and p[0] == day}
+    clock = next(iter(clocks)) if len(clocks) == 1 else None
+    if clock is None:
+        # OCR 날짜 줄에 시각이 없으면 VLM 시각이 영수증에 찍혀 있을 때만 남긴다
+        vlm_clock = value[11:16] if len(value) >= 16 else None
+        if vlm_clock and _clock_is_printed(vlm_clock, ocr_lines):
+            clock = vlm_clock
+    fixed = f"{day} {clock}" if clock else day
+    parsed["purchased_at"] = fixed
+    corrections.append({"field": "purchased_at", "before": value, "after": fixed, "reason": "date_from_ocr"})
 
 
 def _merge_wrapped_names(kept: list[dict], corrections: list):
@@ -887,6 +1099,7 @@ def _merge(parsed: dict, ocr_lines: list[dict]) -> tuple[dict, list[dict]]:
 
     _scrub_placeholders(parsed)
     _drop_invented_midnight(parsed, ocr_lines, corrections)
+    _fix_date_from_ocr(parsed, ocr_lines, corrections)
     items = parsed.get("items") or []
     kept = [it for it in items if not _SUMMARY_LINE.match((it.get("name") or "").strip())]
     parsed["items"] = kept
@@ -906,7 +1119,9 @@ def _merge(parsed: dict, ocr_lines: list[dict]) -> tuple[dict, list[dict]]:
                 sub["name"] = re.sub(r"^[-*+└>›»▶►▸~\s]+", "", sub["name"])  # 옵션 기호 제거
             _correct_name(sub, "name", "item.sub_items.name", ocr_texts, corrections)
 
-    _apply_layout(kept, layout, ocr_texts, corrections)
+    restorable = _apply_layout(kept, layout, ocr_texts, corrections)
+    if restorable:
+        parsed["_restorable"] = restorable
     _demote_marked_items(kept, corrections)
     summary_from_subs = _fold_discount_subitems(kept, corrections)
 
@@ -984,6 +1199,7 @@ def _strip_private(parsed: dict) -> None:
             if sub.get("price") is not None:
                 sub["price"] = _as_int(sub["price"])
     parsed.pop("_paid_from_ocr", None)
+    parsed.pop("_restorable", None)
     total = parsed.get("total_amount")
     # 품목 검산은 합계가 영수증에서 확인됐을 때만 의미가 있다. VLM 이 스스로 맞춘 합계와
     # 품목이 서로 맞는 것은 검증이 아니다.

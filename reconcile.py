@@ -286,6 +286,7 @@ class Edit:
     item: int = -1
     sub: int = -1
     amount: int = 0
+    ref: int = -1  # add_item 이 되살릴 후보(parsed["_restorable"])의 번호
 
     def delta(self, items: list[dict]) -> int:
         """적용하면 계산 합계가 얼마나 바뀌는가."""
@@ -301,7 +302,7 @@ class Edit:
             return -self.amount
         if self.kind == "drop_item_discount":
             return _int(items[self.item].get("discount"))
-        if self.kind in ("unit_price", "layout_price"):
+        if self.kind in ("unit_price", "layout_price", "add_item"):
             return self.amount
         raise ValueError(self.kind)
 
@@ -314,12 +315,36 @@ def _tax_split(total: int) -> set[int]:
     return out
 
 
+# 이름이 흐려 그 줄만으로는 안 되살린 품목을 되살리는 비용. 합계가 정확히 맞아야만 쓰이도록 할인
+# 추가(1.0)·금액 교정(1.0~1.2)보다 비싸게, 품목 삭제(1.5)보다는 싸게 둔다.
+_ADD_ITEM_COST = 1.3
+# 품목이 아닌 줄의 어휘: 표 머리글, 배달비, 결제·할인 줄
+_NON_ITEM_WORD = re.compile(r"상품명|품명|메뉴|수량|단가|금액|배달|배송|결제|할인|쿠폰|적립|영수|합계|소계|총액|거래|매출|사업자|전화")
+
+
+def _looks_like_non_item(name) -> bool:
+    if label_level(name):
+        return True
+    return bool(_NON_ITEM_WORD.search(_hangul(name)))
+
+
 def _candidate_edits(items: list[dict], ev: Evidence, totals: set[int], used_discounts: Counter,
-                     current_discount: int = 0) -> list[Edit]:
+                     current_discount: int = 0, restorable: list[dict] | None = None) -> list[Edit]:
     edits: list[Edit] = []
     total_like = set(totals)
     for total in totals:
         total_like |= _tax_split(total)
+    not_an_item = (ev.summary | total_like) - {0}
+    for ref, cand in enumerate(restorable or []):
+        price, disc = _int(cand.get("price")), _int(cand.get("discount"))
+        # 되살리면 합계는 (금액 − 품목 할인) 만큼 늘지만, 그 할인이 이미 영수증 단위 할인으로 센 것이면
+        # 전체 할인이 그만큼 줄어 도로 늘어난다. 둘이 상쇄되는 경우만 후보로 둔다.
+        if price <= 0 or disc > current_discount:
+            continue
+        # 합계·결제·헤더·배달비 줄이나 요약부 금액(합계·부가세)을 품목으로 되살리면, 합계가 맞아 보여도 틀린 결과다.
+        if price in not_an_item or _looks_like_non_item(cand.get("name")):
+            continue
+        edits.append(Edit("add_item", _ADD_ITEM_COST, amount=price, ref=ref))
     suspicious_amounts = (ev.summary | total_like) - {0}
     for i, item in enumerate(items):
         price = _int(item.get("price"))
@@ -394,7 +419,7 @@ def _compatible(combo: tuple[Edit, ...]) -> bool:
     touched_items: set[int] = set()
     sub_edits: dict[int, set[int]] = {}
     for e in combo:
-        if e.kind == "add_discount":
+        if e.kind in ("add_discount", "add_item"):
             continue
         if e.kind in _ITEM_LEVEL:
             if e.item in touched_items or e.item in sub_edits:
@@ -429,12 +454,12 @@ _MAX_EDITS = 2
 _MAX_CANDIDATES = 120
 _MAX_TOTALS = 8
 _PREFERENCE = ["add_discount", "drop_sub", "drop_item", "layout_price", "unit_price",
-               "drop_item_discount", "opts_included", "price_is_net"]
+               "drop_item_discount", "opts_included", "price_is_net", "add_item"]
 _FEE_GAP_COST = 1.5
 
 
 def solve(items: list[dict], discount: int, fee: int, candidates: list[Candidate], ev: Evidence,
-          used_discounts: Counter) -> Solution | None:
+          used_discounts: Counter, restorable: list[dict] | None = None) -> Solution | None:
     """믿을 만한 후보 등급부터, 그 등급의 결제액을 맞추는 최소 비용 수정을 찾는다.
 
     - VLM 만 말한 결제액(등급 2)은 OCR 근거가 하나도 없을 때만 본다.
@@ -451,7 +476,8 @@ def solve(items: list[dict], discount: int, fee: int, candidates: list[Candidate
         by_tier.pop(2, None)
 
     # 품목이 아주 많은 영수증에서도 조합 수가 터지지 않게 싼(근거가 강한) 수정만 남긴다.
-    edits = sorted(_candidate_edits(items, ev, totals, used_discounts, discount), key=lambda e: e.cost)[:_MAX_CANDIDATES]
+    edits = sorted(_candidate_edits(items, ev, totals, used_discounts, discount, restorable),
+                   key=lambda e: e.cost)[:_MAX_CANDIDATES]
     deltas = [e.delta(items) for e in edits]
     combos: list[tuple[int, float, tuple[Edit, ...]]] = [(base, 0.0, ())]
     for size in range(1, _MAX_EDITS + 1):
@@ -482,6 +508,10 @@ def solve(items: list[dict], discount: int, fee: int, candidates: list[Candidate
                     if not (ev.fee_unread and fee == 0 and 100 <= gap <= 10000 and gap % 100 == 0):
                         continue
                     fee_added, cost = gap, cost + _FEE_GAP_COST
+                if any(e.kind == "add_item" for e in combo) and not _restore_consistent(
+                    items, discount, fee, combo, restorable or [], paid - fee_added
+                ):
+                    continue  # 되살린 품목의 할인이 전체 할인과 겹쳐 합계가 어긋난다
                 best.append(Solution(paid, combo, fee_added, cost, ocr_backed=tier < 2))
         if not best:
             continue
@@ -489,14 +519,46 @@ def solve(items: list[dict], discount: int, fee: int, candidates: list[Candidate
         top = [s for s in best if abs(s.cost - low) < 1e-9]
         if len({s.paid for s in top}) > 1:
             return None  # 같은 비용으로 서로 다른 결제액이 맞는다 — 모호하면 손대지 않는다
+        # 서로 다른 줄을 되살려도 같은 비용으로 맞는다면 어느 쪽이 맞는지 모른다 — 손대지 않는다.
+        restored_sets = {frozenset(e.ref for e in s.edits if e.kind == "add_item") for s in top}
+        if len(restored_sets - {frozenset()}) > 1:
+            return None
         # 결제액은 같고 고치는 방법만 다르면, 근거가 강한 수정부터 고른다.
         return min(top, key=lambda s: sorted(_PREFERENCE.index(e.kind) for e in s.edits))
     return None
 
 
+def _restored_item(cand: dict) -> dict:
+    return {
+        "name": cand.get("name"),
+        "quantity": cand.get("quantity"),
+        "price": _int(cand.get("price")),
+        "sub_items": [],
+        "discount": _int(cand.get("discount")),
+        "_src": "ocr",
+        "_pos": cand.get("_pos"),
+    }
+
+
+def _restore_consistent(items: list[dict], discount: int, fee: int, combo: tuple[Edit, ...],
+                        restorable: list[dict], paid: int) -> bool:
+    """되살린 품목을 실제로 넣고 다른 수정도 적용했을 때 합계가 정말 결제액이 되는가."""
+    trial = [dict(i, sub_items=[dict(s) for s in i.get("sub_items") or []]) for i in items]
+    top = discount
+    for e in combo:
+        if e.kind == "add_item":
+            cand = restorable[e.ref]
+            trial.append(_restored_item(cand))
+            top = max(0, top - _int(cand.get("discount")))
+    # add_item 외의 수정은 합계를 더할 뿐이라(할인 추가·금액 교정…) 여기서는 그 변화량만 더한다
+    others = sum(e.delta(items) for e in combo if e.kind != "add_item")
+    return computed_total(trial, top, fee) + others == paid
+
+
 def apply(items: list[dict], parsed: dict, sol: Solution, corrections: list) -> None:
     drops_items = {e.item for e in sol.edits if e.kind == "drop_item"}
     drops_subs = {(e.item, e.sub) for e in sol.edits if e.kind == "drop_sub"}
+    restored: list[dict] = []
     for e in sol.edits:
         item = items[e.item] if e.item >= 0 else None
         if e.kind == "drop_item":
@@ -526,9 +588,24 @@ def apply(items: list[dict], parsed: dict, sol: Solution, corrections: list) -> 
         elif e.kind == "add_discount":
             parsed["discount"] = _int(parsed.get("discount")) + e.amount
             corrections.append(_corr("discount", "", f"+{e.amount:,} (OCR 할인 줄)", "reconciled"))
+        elif e.kind == "add_item":
+            restored.append(parsed["_restorable"][e.ref])
     for i, item in enumerate(items):
         item["sub_items"] = [s for j, s in enumerate(item.get("sub_items") or []) if (i, j) not in drops_subs]
     items[:] = [it for i, it in enumerate(items) if i not in drops_items]
+    # 되살린 품목은 영수증에 찍힌 순서대로 끼워 넣는다(순서를 모르면 맨 뒤)
+    for cand in sorted(restored, key=lambda c: c.get("_pos") if c.get("_pos") is not None else 10**6):
+        new_item = _restored_item(cand)
+        pos = cand.get("_pos")
+        at = len(items)
+        if pos is not None:
+            at = 0
+            for k, it in enumerate(items):
+                if it.get("_pos") is not None and it["_pos"] < pos:
+                    at = k + 1
+        items.insert(at, new_item)
+        parsed["discount"] = max(0, _int(parsed.get("discount")) - new_item["discount"])
+        corrections.append(_corr("items", "(VLM 누락, 합계 검산)", str(new_item.get("name")), "ocr_recovered"))
     if sol.fee_added:
         parsed["delivery_fee"] = _int(parsed.get("delivery_fee")) + sol.fee_added
         corrections.append(_corr("delivery_fee", "0", f"{sol.fee_added:,} (결제액 − 품목 차액)", "reconciled"))
@@ -753,7 +830,8 @@ def reconcile(parsed: dict, layout, ocr_lines: list[dict], corrections: list) ->
 
     drop_total_echoes(items, {c.value for c in candidates}, corrections,
                       confirmed={c.value for c in candidates if c.tier < 2})
-    sol = solve(items, _int(parsed.get("discount")), _int(parsed.get("delivery_fee")), candidates, ev, used)
+    sol = solve(items, _int(parsed.get("discount")), _int(parsed.get("delivery_fee")), candidates, ev, used,
+                parsed.get("_restorable"))
     if sol is None:
         return False
     apply(items, parsed, sol, corrections)
