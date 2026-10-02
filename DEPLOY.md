@@ -145,3 +145,22 @@ adapter.out에 OCR Output Port 구현체를 만들어 `POST http://<홈서버IP>
 
 맥에서는 환경변수 없이 `.venv/bin/python server.py`를 실행하면
 자동으로 MLX 백엔드(Qwen2.5-VL-3B 4bit)로 동작합니다.
+
+
+## VLM 교체 실험 (Qwen3-VL)
+
+기본 구성은 Qwen2.5-VL-7B(AWQ)다. 하위 옵션·작은 글씨 인식이 약해서, Qwen3-VL 로 바꿔 같은 영수증으로 비교해
+볼 수 있게 override 파일을 뒀다. 기본 구성은 건드리지 않는다.
+
+```bash
+cd ~/howmuch-ai-server
+docker compose -f docker-compose.yml -f docker-compose.qwen3vl.yml pull vllm
+docker compose -f docker-compose.yml -f docker-compose.qwen3vl.yml up -d
+docker compose logs -f vllm      # 모델(약 17GB) 내려받고 뜰 때까지
+```
+
+- vLLM 이 Qwen3-VL 을 읽으려면 0.11 이상이어야 한다(`pull` 이 그 이유다).
+- 메모리가 모자라면 `QWEN3VL_MODEL=Qwen/Qwen3-VL-8B-Instruct-FP8`(약 10GB) 또는
+  `Qwen/Qwen3-VL-4B-Instruct` 를 앞에 붙여 다시 올린다. 3090(Ampere)에서 FP8 은 되는 경우도 안 되는 경우도 있다.
+- 서버를 올린 뒤 같은 63장으로 재 보고 `_subscore.py`(옵션)·`_dump.py --score`(합계·구성)로 기존 결과와 비교한다.
+- 되돌리기: `docker compose up -d` (override 없이).
