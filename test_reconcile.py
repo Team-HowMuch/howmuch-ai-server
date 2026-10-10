@@ -984,3 +984,112 @@ def test_restore_item_discount_larger_than_the_receipt_discount_is_not_offered()
     cand = dict(_cand("새우깡", 2500), discount=500)
     # 2500 - 500 = 2000 이 더해져야 3000 이 되지만, 할인 500 이 영수증 할인 0 에 이미 들어 있지 않다
     assert _restore_case([cand]) is None
+
+
+# ---------------------------------------------------------------- 합성 영수증에서 나온 회귀
+
+def _delivery_lines(rows):
+    """배달앱 영수증 흉내: (라벨, 금액) 목록을 위에서 아래로 한 줄씩."""
+    lines = _HEADER + [_line("배달의민족 주문서", 100, 120)]
+    y = 150
+    for label, amount in rows:
+        if label is not None:
+            lines += [_line(label, 100, y)]
+        if amount is not None:
+            lines += [_line(amount, 600, y)]
+        y += 50
+    return lines
+
+
+def test_weak_order_amount_is_not_the_paid_total_when_a_discounted_amount_is_printed():
+    """`주문금액` 은 할인 전 품목 합이다. `주문금액 할인쿠폰 -2,000` 이 있고 거기서 뺀 값이 찍혀 있으면 그 값이 결제액이다."""
+    lines = _delivery_lines([
+        ("순대", "4,500"), ("떡볶이", "9,500"), ("납작만두", "3,000"),
+        ("주문금액", "17,000"),
+        ("주문금액 할인쿠폰", "0"), (None, "-2,000"),
+        (None, "15,000"),
+    ])
+    parsed = {
+        "items": [
+            {"name": "순대", "quantity": 1, "price": 4500},
+            {"name": "떡볶이", "quantity": 1, "price": 9500},
+            {"name": "납작만두", "quantity": 1, "price": 3000},
+        ],
+        "total_amount": 17000,
+    }
+    merged, _ = _merge_with(parsed, lines)
+    assert merged["total_amount"] == 15000
+    assert merged["discount"] == 2000
+    assert merged["items_verified"] is True
+
+
+def test_discount_coupon_row_is_not_a_weak_total_label():
+    from layout import analyze_receipt
+
+    lines = _delivery_lines([("순대", "4,500"), ("주문금액 할인쿠폰", "-2,000")])
+    assert analyze_receipt(lines).total_amount is None
+
+
+def test_unreadable_delivery_fee_label_is_filled_from_the_exact_gap():
+    """배달비 라벨이 영문으로 깨져도(`IAHA 1,000`) 차액과 정확히 같으면 배달비다."""
+    lines = _delivery_lines([
+        ("공기밥", "1,000"), ("IAHA", "1,000"), ("합계금액", "2,000"),
+    ])
+    parsed = {"items": [{"name": "공기밥", "quantity": 1, "price": 1000}], "total_amount": 2000}
+    merged, corrections = _merge_with(parsed, lines)
+    assert merged["delivery_fee"] == 1000
+    assert [i["price"] for i in merged["items"]] == [1000]
+
+
+def test_unreadable_fee_row_is_not_used_when_the_gap_differs():
+    lines = _delivery_lines([
+        ("공기밥", "1,000"), ("IAHA", "1,500"), ("합계금액", "2,000"),
+    ])
+    parsed = {"items": [{"name": "공기밥", "quantity": 1, "price": 1000}], "total_amount": 2000}
+    merged, _ = _merge_with(parsed, lines)
+    assert merged["delivery_fee"] == 0
+
+
+def test_a_larger_paid_label_blocks_a_smaller_balanced_total():
+    """결제 라벨(72,000)이 더 큰데 품목합(70,000)이 우연히 `주문금액 − 할인` 으로 맞아 검증되면 안 된다."""
+    lines = _delivery_lines([
+        ("뼈해장국", "20,000"), ("수육", "50,000"),
+        ("주문금액", "70,000"), ("주문금액 할인쿠폰", "0"), (None, "-2,000"), ("총 결제금액", "72,000"),
+    ])
+    parsed = {
+        "items": [
+            {"name": "뼈해장국", "quantity": 1, "price": 20000},
+            {"name": "수육", "quantity": 1, "price": 50000},
+        ],
+        "total_amount": 70000,
+    }
+    merged, _ = _merge_with(parsed, lines)
+    assert merged["items_verified"] is False
+
+
+def test_vlm_total_seen_only_as_a_subtotal_is_not_verified():
+    """합계 라벨을 못 읽고, 요약부에 더 큰 금액이 두 번 찍혀 있으면 VLM 합계는 소계일 수 있다."""
+    lines = _delivery_lines([
+        ("감자튀김", "3,200"), ("불고기버거", "5,900"), ("새우버거", "5,500"),
+        ("소계금액", None), ("농문류", "2,000"), (None, "14,600"),
+        ("배영위", "16,600"), (None, "16,600"),
+    ])
+    parsed = {
+        "items": [
+            {"name": "감자튀김", "quantity": 1, "price": 3200},
+            {"name": "불고기버거", "quantity": 1, "price": 5900},
+            {"name": "새우버거", "quantity": 1, "price": 5500},
+        ],
+        "total_amount": 14600,
+    }
+    merged, _ = _merge_with(parsed, lines)
+    assert merged["items_verified"] is False
+    assert merged["total_verified"] is False
+
+
+def test_zero_priced_item_without_options_is_not_verified():
+    """0원 품목은 품목을 읽다 만 신호다. 합계에 맞추려고 만든 할인·배달비로 검증되면 안 된다."""
+    lines = _delivery_lines([("치킨무", "0"), ("주문금액", "1,000"), ("합계", "1,000")])
+    parsed = {"items": [{"name": "치킨무", "quantity": 1, "price": 0}], "total_amount": 1000}
+    merged, _ = _merge_with(parsed, lines)
+    assert merged["items_verified"] is False

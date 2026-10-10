@@ -60,7 +60,7 @@ _DISCOUNT_WORD = re.compile(r"할인|말인|합인|에누리|에누ㄹ|쿠폰|�
 # 합계부의 할인 "요약" 라벨. 품목별 할인 줄들의 합계를 다시 적은 것이라 또 빼면 이중차감이다.
 # 실측: `할인금액 : -1,510`(홈푸드마트), `총할인액 -12,000`·`쿠폰할인 -12,000`(하나로마트),
 # `할인(에누리) -23,980`(홈플러스), `에누리계 -22,240`(신세계)
-_DISCOUNT_TOTAL_LABEL = re.compile(r"할인금액|합인금액|총할인|할인계|할인액|에누리계|할인\(에누리\)|쿠폰할인|쿠폰말인")
+_DISCOUNT_TOTAL_LABEL = re.compile(r"할인금액|합인금액|총할인|할인계|할인액|에누리계|할인\(에누리\)|쿠폰할인|쿠폰말인|할인쿠폰")
 
 # 할인처럼 보이지만 할인이 아닌 줄.
 # `할인: 0, 현재잔액: 5,000` 은 농·축산물 할인지원금 한도 안내이고,
@@ -205,6 +205,9 @@ class Layout:
     delivery_fee: int | None = None
     #: 품목 영역이 끝나는 줄 번호(rows 기준). 그 뒤는 합계·세금·결제 같은 요약부다.
     summary_start: int = 0
+    #: total_amount 가 `주문금액` 같은 보조 라벨에서만 나왔다. 배달앱의 주문금액은 할인 전 품목 합이라
+    #: 실제 결제액이 아닐 수 있다.
+    total_is_weak: bool = False
 
 
 def _to_tokens(ocr_lines: list[dict]) -> list[Token]:
@@ -657,10 +660,12 @@ def analyze_receipt(ocr_lines: list[dict]) -> Layout:
             # "받을금액: 0"(미수금) 같은 0원 라벨이 실제 합계를 덮어쓰지 않게 한다
             if value is not None and (value > 0 or total is None):
                 total = value
-        elif _TOTAL_LABEL_WEAK.search(compact):
+        elif _TOTAL_LABEL_WEAK.search(compact) and not _DISCOUNT_WORD.search(compact):
+            # `주문금액 할인쿠폰 -2,000` 은 주문금액 라벨이 붙었을 뿐 할인 줄이다.
             value = _parse_row(row)["price"]
             if value is not None and (value > 0 or weak_total is None):
                 weak_total = value
+    total_is_weak = total is None and weak_total is not None
     if total is None:
         total = weak_total
     return Layout(
@@ -671,6 +676,7 @@ def analyze_receipt(ocr_lines: list[dict]) -> Layout:
         summary_discount=summary_discount,
         delivery_fee=delivery_fee,
         summary_start=end,
+        total_is_weak=total_is_weak,
     )
 
 

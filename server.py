@@ -1228,7 +1228,10 @@ def _merge(parsed: dict, ocr_lines: list[dict]) -> tuple[dict, list[dict]]:
     if isinstance(total, (int, float)):
         t = int(total)
         if layout_total is None:
-            parsed["total_verified"] = t in _ocr_numbers(ocr_lines)
+            # 합계 라벨을 못 읽었을 때는 숫자가 영수증에 찍혀 있다는 것뿐이라, 요약부에 그보다 큰 금액이
+            # 두 번 이상 찍혀 있으면(소계 뒤에 배달비가 더해진 최종 결제액) 그 숫자는 소계일 수 있다.
+            larger = any(v > t for v in rec.collect_evidence(layout, ocr_lines).repeated)
+            parsed["total_verified"] = t in _ocr_numbers(ocr_lines) and not larger
         elif t == layout_total:
             # "합계" 라벨 옆 숫자와 정확히 일치 (임의 숫자 일치 오검증 방지)
             parsed["total_verified"] = True
@@ -1280,8 +1283,10 @@ def _strip_private(parsed: dict) -> None:
     total = parsed.get("total_amount")
     # 품목 검산은 합계가 영수증에서 확인됐을 때만 의미가 있다. VLM 이 스스로 맞춘 합계와
     # 품목이 서로 맞는 것은 검증이 아니다.
+    # 품목 줄 금액(옵션 포함)이 0원인 품목이 있으면 품목을 읽다 만 것이다. 합계에 맞추려고 할인·배달비가 만들어졌을 수 있다.
     parsed["items_verified"] = (
         bool(parsed.get("total_verified"))
+        and all(rec.line_total(item) > 0 for item in parsed.get("items") or [])
         and isinstance(total, (int, float))
         and not isinstance(total, bool)
         and bool(parsed.get("items"))

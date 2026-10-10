@@ -169,6 +169,9 @@ class Evidence:
     unlabeled_positive: set[int] = field(default_factory=set)
     #: 요약부 행들의 한글(라벨일 수 있는 이름이 정말 요약부에 찍혔는지 볼 때 쓴다)
     summary_text: list[str] = field(default_factory=list)
+    #: 배달 영수증에서 라벨이 한글로 읽히지 않은(`IAHA 1,000`) 배달비 후보 금액. 라벨이 깨졌다는 것만 근거라
+    #: 차액과 정확히 같을 때만 배달비로 채운다.
+    stray_fee: set[int] = field(default_factory=set)
 
 
 def _is_unread_fee_row(row) -> bool:
@@ -197,6 +200,14 @@ def collect_evidence(layout, ocr_lines: list[dict]) -> Evidence:
     ev.delivery = any(_DELIVERY_RECEIPT.search(line.get("text") or "") for line in ocr_lines)
     if layout.delivery_fee is None:
         ev.fee_unread = any(_is_unread_fee_row(row) for row in rows[layout.summary_start:])
+
+    if ev.delivery and layout.delivery_fee is None:
+        for row in rows[max(0, layout.summary_start - 2):]:
+            if _hangul(row.text) or not re.search(r"[A-Za-z]", row.text):
+                continue
+            money = _formatted_money(row)
+            if len(money) == 1 and 500 <= money[0] <= 10000 and money[0] % 100 == 0:
+                ev.stray_fee.add(money[0])
 
     in_section = False  # 배민 `결제 금액 상세` 아래
     section_paid_seen = False
@@ -505,7 +516,8 @@ def solve(items: list[dict], discount: int, fee: int, candidates: list[Candidate
                     # 마지막 수단: 배달 영수증에서 번져 못 읽은 배달팁을 차액으로 채운다.
                     if tier == 0 and label_balances:
                         continue
-                    if not (ev.fee_unread and fee == 0 and 100 <= gap <= 10000 and gap % 100 == 0):
+                    unread = ev.fee_unread and 100 <= gap <= 10000 and gap % 100 == 0
+                    if not (fee == 0 and (unread or gap in ev.stray_fee)):
                         continue
                     fee_added, cost = gap, cost + _FEE_GAP_COST
                 if any(e.kind == "add_item" for e in combo) and not _restore_consistent(
@@ -523,8 +535,13 @@ def solve(items: list[dict], discount: int, fee: int, candidates: list[Candidate
         restored_sets = {frozenset(e.ref for e in s.edits if e.kind == "add_item") for s in top}
         if len(restored_sets - {frozenset()}) > 1:
             return None
+        chosen = min(top, key=lambda s: sorted(_PREFERENCE.index(e.kind) for e in s.edits))
+        # 결제 라벨(등급 0)이 맞춘 값보다 큰데도 더 낮은 금액이 "맞았다"면 우연히 맞은 것이다. 분할 결제는
+        # 결제 라벨이 합계보다 작다. 라벨이 더 크면 품목이나 배달비·옵션을 놓친 것이니 검증됐다고 하지 않는다.
+        if tier > 0 and any(p > chosen.paid for p in by_tier.get(0, ())):
+            return None
         # 결제액은 같고 고치는 방법만 다르면, 근거가 강한 수정부터 고른다.
-        return min(top, key=lambda s: sorted(_PREFERENCE.index(e.kind) for e in s.edits))
+        return chosen
     return None
 
 
@@ -785,16 +802,19 @@ def _candidates(parsed: dict, layout, ev: Evidence) -> list[Candidate]:
                 out.append(Candidate(target, 1))
                 break
     out.extend(Candidate(p, 0) for p in paid)
-    if label_total:
-        out.append(Candidate(label_total, 1))
     out.extend(Candidate(v, 1) for v in ev.repeated)
     # 요약부에 찍힌 금액 중 `합계 − 할인` 과 같은 값은 할인 뒤 결제액이다(홈플러스: 100,640 − 23,980 = 76,660).
+    label_discounted = False
     for base_total in {label_total or 0, _int(parsed.get("total_amount"))} - {0}:
         for d in ev.discounts:
             value = base_total - d
             # 할인이 합계의 절반을 넘거나, 그 값이 부가세·공급가액이면 우연히 맞은 숫자다
             if value in ev.summary and value * 2 >= base_total and value not in _tax_split(base_total):
                 out.append(Candidate(value, 1))
+                label_discounted = label_discounted or base_total == label_total
+    # `주문금액` 만으로 얻은 합계는 할인 전 금액이다. 거기서 할인을 뺀 금액이 따로 찍혀 있으면 그쪽이 결제액이다.
+    if label_total and not (layout.total_is_weak and label_discounted):
+        out.append(Candidate(label_total, 1))
     vlm_total = _int(parsed.get("total_amount"))
     if vlm_total > 0:
         out.append(Candidate(vlm_total, 2))
