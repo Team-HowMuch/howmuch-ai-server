@@ -1093,3 +1093,22 @@ def test_zero_priced_item_without_options_is_not_verified():
     parsed = {"items": [{"name": "치킨무", "quantity": 1, "price": 0}], "total_amount": 1000}
     merged, _ = _merge_with(parsed, lines)
     assert merged["items_verified"] is False
+
+
+def test_absurd_delivery_fee_is_discarded():
+    """기울어진 사진에서 합계가 배달팁 줄에 붙어 `배달팁 40,900` 으로 읽혔다. 배달비는 합계만큼 클 수 없다."""
+    lines = _delivery_lines([
+        ("치킨마요", "4,900"), ("김치찌개", "5,500"),
+        ("배달팁", "40,900"),
+    ])
+    parsed = {
+        "items": [
+            {"name": "치킨마요", "quantity": 1, "price": 4900},
+            {"name": "김치찌개", "quantity": 1, "price": 5500},
+        ],
+        "total_amount": 40900,
+    }
+    merged, corrections = _merge_with(parsed, lines)
+    assert merged["delivery_fee"] == 0
+    assert "fee_implausible" in _reasons(corrections)
+    assert merged["items_verified"] is False

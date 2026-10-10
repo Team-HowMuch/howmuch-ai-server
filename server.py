@@ -1071,6 +1071,10 @@ def _take_fees(entries: list[dict]) -> tuple[list[dict], list[tuple[str, int, st
     return remaining, taken
 
 
+# 배달비로 믿는 상한. 배달앱 배달비(기본 + 할증)는 이보다 커 본 적이 없다.
+_MAX_PLAUSIBLE_FEE = 15000
+
+
 def _extract_delivery_fee(
     kept: list[dict], layout, corrections: list, vlm_field: object = None
 ) -> int:
@@ -1139,6 +1143,14 @@ def _extract_delivery_fee(
     if not moved and field > 0:
         from_vlm = field
     fee = layout.delivery_fee if layout.delivery_fee is not None else from_vlm
+    if fee > _MAX_PLAUSIBLE_FEE:
+        # 기울어진 사진에서 합계 줄이 배달비 줄에 붙어 `배달팁 40,900` 처럼 읽힌 경우다. 배달비로 믿지 않고
+        # 배달비 줄을 못 읽은 것으로 되돌려, 합계 검산이 차액으로 다시 찾게 한다.
+        corrections.append(
+            {"field": "delivery_fee", "before": f"{fee:,}", "after": "0", "reason": "fee_implausible"}
+        )
+        fee = 0
+        layout.delivery_fee = None
     for name, price, _ in moved:
         corrections.append(
             {
