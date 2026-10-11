@@ -1112,3 +1112,60 @@ def test_absurd_delivery_fee_is_discarded():
     assert merged["delivery_fee"] == 0
     assert "fee_implausible" in _reasons(corrections)
     assert merged["items_verified"] is False
+
+
+# ---------------------------------------------------------------- 단가로 적는 모델 (Qwen3-VL)
+
+def test_unit_price_scaled_to_the_printed_line_amount():
+    """Qwen3-VL 실측: `12,000 × 5 = 60,000` 줄에서 price 를 단가 12,000 으로 적었다."""
+    lines = _HEADER + _row("초벌연막창", "60,000", 150, qty=5) + _row("토닉워터", "2,000", 200) \
+        + _row("합계", "62,000", 300) + _row("카드결제", "62,000", 350)
+    parsed = {"items": [_it("초벌연막창", 12000, qty=5), _it("토닉워터", 2000)], "total_amount": 62000}
+    merged, corrections = _run(parsed, lines)
+    assert [i["price"] for i in merged["items"]] == [60000, 2000]
+    assert "unit_price_scaled" in _reasons(corrections)
+    assert merged["items_verified"] is True
+
+
+def test_unit_price_scaled_keeps_a_correct_line_amount_untouched():
+    lines = _HEADER + _row("초벌연막창", "60,000", 150, qty=5) + _row("합계", "60,000", 300) + _row("카드결제", "60,000", 350)
+    merged, corrections = _run({"items": [_it("초벌연막창", 60000, qty=5)], "total_amount": 60000}, lines)
+    assert merged["items"][0]["price"] == 60000
+    assert "unit_price_scaled" not in _reasons(corrections)
+
+
+def test_unit_price_scaled_also_scales_options_printed_multiplied():
+    lines = _HEADER + _row("아메리카노", "8,000", 150, qty=2) + _row("- 샷추가", "1,000", 200) \
+        + _row("합계", "9,000", 300) + _row("카드결제", "9,000", 350)
+    parsed = {"items": [_it("아메리카노", 4000, qty=2, subs=[{"name": "샷추가", "price": 500}])], "total_amount": 9000}
+    merged, _ = _run(parsed, lines)
+    item = merged["items"][0]
+    assert item["price"] == 8000
+    assert [s["price"] for s in item["sub_items"]] == [1000]
+
+
+def test_unit_price_not_scaled_when_the_row_shows_only_the_unit_price():
+    """줄에 단가만 찍힌 영수증(수량 2, 3,000 하나뿐)은 곱하면 안 된다."""
+    lines = _HEADER + _row("콜라", "3,000", 150, qty=2) + _row("김밥", "3,500", 200) \
+        + _row("합계", "6,500", 300) + _row("카드결제", "6,500", 350)
+    merged, corrections = _run({"items": [_it("콜라", 3000, qty=2), _it("김밥", 3500)], "total_amount": 6500}, lines)
+    assert merged["items"][0]["price"] == 3000
+    assert "unit_price_scaled" not in _reasons(corrections)
+
+
+def test_scale_units_edit_needs_the_unit_price_header():
+    """`단가 수량 금액` 머리글이 있고 합계가 단가×수량으로만 맞을 때 줄 금액으로 곱한다."""
+    header = [_line("상품명", 100, 100), _line("단가", 300, 100), _line("수량", 450, 102), _line("금액", 600, 98)]
+    body = _row("초벌연막창", None, 150, qty=5) + [_line("12,000", 300, 150)] \
+        + _row("토닉워터", None, 200, qty=1) + [_line("2,000", 300, 200)] \
+        + _row("합계", "62,000", 300) + _row("카드결제", "62,000", 350)
+    def parsed():
+        return {"items": [_it("초벌연막창", 12000, qty=5), _it("토닉워터", 2000)], "total_amount": 62000}
+
+    merged, corrections = _run(parsed(), header + body)
+    assert [i["price"] for i in merged["items"]] == [60000, 2000]
+    assert merged["items_verified"] is True
+
+    merged, _ = _run(parsed(), _HEADER + body)
+    assert merged["items"][0]["price"] == 12000
+    assert merged["items_verified"] is False

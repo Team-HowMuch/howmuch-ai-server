@@ -589,6 +589,7 @@ def _apply_layout(kept: list[dict], layout, ocr_texts: list[str], corrections: l
             matched.setdefault("_pos", pos)  # 영수증에 찍힌 순서(복구한 품목을 제자리에 넣을 때 쓴다)
             if li.price is not None and li.price > 0 and _names_match(matched.get("name"), li.name):
                 matched["_layout_price"] = li.price  # 합계 검산에서 VLM 금액 대신 쓸 후보
+                matched["_layout_sub_prices"] = [x.price for x in li.sub_items if x.price]
             if subs and not matched.get("sub_items"):
                 matched["sub_items"] = subs
             if li.name and _names_match(matched.get("name"), li.name):  # 이름까지 맞는 부모만(금액만 맞은 짝은 믿지 않는다)
@@ -1209,6 +1210,7 @@ def _merge(parsed: dict, ocr_lines: list[dict]) -> tuple[dict, list[dict]]:
             _correct_name(sub, "name", "item.sub_items.name", ocr_texts, corrections)
 
     restorable = _apply_layout(kept, layout, ocr_texts, corrections)
+    _scale_unit_prices(kept, corrections)
     if restorable:
         parsed["_restorable"] = restorable
     _demote_marked_items(kept, corrections)
@@ -1277,6 +1279,39 @@ def _merge(parsed: dict, ocr_lines: list[dict]) -> tuple[dict, list[dict]]:
         parsed["total_verified"] = False
     _strip_private(parsed)
     return parsed, corrections
+
+
+def _scale_unit_prices(kept: list[dict], corrections: list) -> None:
+    """모델이 수량 곱 전의 단가를 적은 품목을, 영수증 줄에 찍힌 금액으로 바로잡는다.
+
+    계약의 price 는 그 줄에 찍힌 금액(수량을 곱한 값)이다. Qwen3-VL 은 `초벌연막창 5개 60,000` 에서 12,000 을
+    적는 일이 잦다. 좌표가 읽은 같은 줄 금액이 정확히 단가 × 수량이면 그 줄 금액을 쓴다. 옵션도 같은 수량으로
+    곱해 찍히므로, 곱한 값이 그 줄의 옵션 금액과 같을 때만 같이 키운다.
+    """
+    for item in kept:
+        quantity = _as_int(item.get("quantity"))
+        price = _as_int(item.get("price"))
+        layout_price = _as_int(item.get("_layout_price"))
+        if not (1 < quantity <= 50 and price > 0):
+            continue
+        if layout_price != price * quantity:
+            continue
+        item["_price_is_line"] = True
+        item["price"] = layout_price
+        printed = list(item.get("_layout_sub_prices") or [])
+        for sub in item.get("sub_items") or []:
+            sub_price = _as_int(sub.get("price"))
+            if sub_price > 0 and sub_price * quantity in printed:
+                printed.remove(sub_price * quantity)
+                sub["price"] = sub_price * quantity
+        corrections.append(
+            {
+                "field": "item.price",
+                "before": f"{item.get('name')} {price:,} × {quantity}",
+                "after": f"{layout_price:,} (줄에 찍힌 금액)",
+                "reason": "unit_price_scaled",
+            }
+        )
 
 
 def _strip_private(parsed: dict) -> None:

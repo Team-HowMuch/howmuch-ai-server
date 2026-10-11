@@ -172,6 +172,9 @@ class Evidence:
     #: 배달 영수증에서 라벨이 한글로 읽히지 않은(`IAHA 1,000`) 배달비 후보 금액. 라벨이 깨졌다는 것만 근거라
     #: 차액과 정확히 같을 때만 배달비로 채운다.
     stray_fee: set[int] = field(default_factory=set)
+    #: 머리글에 `단가`와 `수량`이 함께 찍힌 영수증. 이런 영수증은 품목 줄에 단가가 먼저 나와서 모델이 금액 대신
+    #: 단가를 적기 쉽다.
+    unit_price_header: bool = False
 
 
 def _is_unread_fee_row(row) -> bool:
@@ -208,6 +211,10 @@ def collect_evidence(layout, ocr_lines: list[dict]) -> Evidence:
             money = _formatted_money(row)
             if len(money) == 1 and 500 <= money[0] <= 10000 and money[0] % 100 == 0:
                 ev.stray_fee.add(money[0])
+
+    ev.unit_price_header = any(
+        "단가" in row.compact and "수량" in row.compact for row in rows[: max(layout.summary_start, 1)]
+    )
 
     in_section = False  # 배민 `결제 금액 상세` 아래
     section_paid_seen = False
@@ -298,6 +305,7 @@ class Edit:
     sub: int = -1
     amount: int = 0
     ref: int = -1  # add_item 이 되살릴 후보(parsed["_restorable"])의 번호
+    items: tuple = ()  # scale_units 가 건드리는 품목 번호들
 
     def delta(self, items: list[dict]) -> int:
         """적용하면 계산 합계가 얼마나 바뀌는가."""
@@ -313,7 +321,7 @@ class Edit:
             return -self.amount
         if self.kind == "drop_item_discount":
             return _int(items[self.item].get("discount"))
-        if self.kind in ("unit_price", "layout_price", "add_item"):
+        if self.kind in ("unit_price", "layout_price", "add_item", "scale_units"):
             return self.amount
         raise ValueError(self.kind)
 
@@ -401,6 +409,22 @@ def _candidate_edits(items: list[dict], ev: Evidence, totals: set[int], used_dis
             # 같은 할인이 두 번이면 뒤에 붙은 쪽이 요약줄이라 뒤쪽을 조금 싸게 둔다.
             edits.append(Edit("drop_item_discount", 1.2 - 0.001 * i, item=i))
 
+    # 영수증 전체가 단가 표기(`단가 수량 금액` 머리글)인데 모델이 단가를 그대로 적은 경우: 수량이 2 이상인 품목
+    # 모두 금액(옵션 포함)이 수량배 되어야 합계가 맞는다. 품목마다 고치면 수정 개수 제한에 걸리므로 한 번에 푼다.
+    scalable = [
+        i for i, it in enumerate(items)
+        if 1 < _int(it.get("quantity")) <= 50 and _int(it.get("price")) > 0 and _int(it.get("discount")) == 0
+        and not it.get("_price_is_line")
+    ]
+    if scalable and ev.unit_price_header:
+        gain = sum(
+            (_int(items[i].get("price")) + sum(_int(x.get("price")) for x in items[i].get("sub_items") or []))
+            * (_int(items[i].get("quantity")) - 1)
+            for i in scalable
+        )
+        if gain > 0:
+            edits.append(Edit("scale_units", 1.1, amount=gain, items=tuple(scalable)))
+
     # 할인 후보는 금액마다 하나(가장 싼 근거)만 둔다. 같은 할인을 두 번 더하지 않는다.
     discount_cost: dict[int, float] = {}
 
@@ -431,6 +455,11 @@ def _compatible(combo: tuple[Edit, ...]) -> bool:
     sub_edits: dict[int, set[int]] = {}
     for e in combo:
         if e.kind in ("add_discount", "add_item"):
+            continue
+        if e.kind == "scale_units":
+            if any(i in touched_items or i in sub_edits for i in e.items):
+                return False
+            touched_items.update(e.items)
             continue
         if e.kind in _ITEM_LEVEL:
             if e.item in touched_items or e.item in sub_edits:
@@ -464,7 +493,7 @@ class Candidate:
 _MAX_EDITS = 2
 _MAX_CANDIDATES = 120
 _MAX_TOTALS = 8
-_PREFERENCE = ["add_discount", "drop_sub", "drop_item", "layout_price", "unit_price",
+_PREFERENCE = ["add_discount", "drop_sub", "drop_item", "layout_price", "unit_price", "scale_units",
                "drop_item_discount", "opts_included", "price_is_net", "add_item"]
 _FEE_GAP_COST = 1.5
 
@@ -598,6 +627,16 @@ def apply(items: list[dict], parsed: dict, sol: Solution, corrections: list) -> 
             item["price"] = before + e.amount
             why = "단가 × 수량" if e.kind == "unit_price" else "좌표가 읽은 금액"
             corrections.append(_corr("item.price", str(before), f"{item['price']} ({why})", "reconciled"))
+        elif e.kind == "scale_units":
+            for i in e.items:
+                scaled = items[i]
+                quantity = _int(scaled.get("quantity"))
+                before = _int(scaled.get("price"))
+                scaled["price"] = before * quantity
+                for sub in scaled.get("sub_items") or []:
+                    sub["price"] = _int(sub.get("price")) * quantity
+                corrections.append(_corr("item.price", f"{scaled.get('name')} {before:,} × {quantity}",
+                                         f"{scaled['price']:,} (단가 × 수량)", "reconciled"))
         elif e.kind == "drop_item_discount":
             before = _int(item.get("discount"))
             item["discount"] = 0
