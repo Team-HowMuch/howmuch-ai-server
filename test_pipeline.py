@@ -243,8 +243,9 @@ def test_date_ocr_misreading_is_rejected_by_the_printed_weekday():
 def test_date_with_four_digit_year_and_bracketed_weekday():
     """홈플러스: `2026/05/3115:36:00[일]`. 2026-05-31 은 일요일이다."""
     assert _fix_date("2023-05-31 15:36", "2026/05/3115:36:00[일]") == ("2026-05-31 15:36", ["date_from_ocr"])
-    # 요일이 안 맞으면 그 줄은 믿지 않는다
-    assert _fix_date("2023-05-31 15:36", "2026/05/3115:36:00[월]") == ("2023-05-31 15:36", [])
+    # 요일이 안 맞으면 그 줄은 믿지 않는다(날짜 출처가 date_from_ocr 이 아니다). 쓸 수 있는 날짜가 없고 2023 은
+    # 영수증에 안 찍혀 있으므로 연도만 최근으로 옮긴다
+    assert _fix_date("2023-05-31 15:36", "2026/05/3115:36:00[월]") == ("2026-05-31 15:36", ["stale_year"])
 
 
 def test_date_only_the_year_differs_keeps_the_later_year():
@@ -273,6 +274,7 @@ def test_date_far_future_or_past_is_not_a_date():
 
 
 def test_date_low_confidence_line_is_ignored():
+    # 신뢰도 낮은 줄의 26-07-01 을 날짜로 쓰지 않는다. 그 줄이 월·일이 다른 최근 날짜라 연도만 옮기지도 않는다
     assert _fix_date("2023-07-26", "판매일:26-07-01", conf=0.5) == ("2023-07-26", [])
 
 
@@ -367,3 +369,65 @@ def test_date_future_vlm_year_is_not_protected_by_the_later_year_rule():
 
 def test_date_vlm_date_glued_to_the_time_counts_as_printed():
     assert _fix_date("2026-08-08 18:32", "2026.08.0818:32:43", "2026.08.0818:33:44") == ("2026-08-08 18:32", [])
+
+
+def test_date_glued_after_a_label_is_read():
+    """실측: `판매일:260820 19:07,목요일`. VLM 은 `2023-08-26` 으로 읽었다. 2026-08-20 은 목요일이다."""
+    assert _fix_date("2023-08-26 19:07", "판매일:260820 19:07,목요일 계산대:003") == (
+        "2026-08-20 19:07", ["date_from_ocr"])
+    assert _fix_date("2023-08-20", "거래일 20260820") == ("2026-08-20", ["date_from_ocr"])
+
+
+def test_date_glued_to_the_time_and_label_suffixes():
+    # OCR 이 날짜와 시각 사이 공백을 떨어뜨린 경우. 2026-08-20 은 목요일이다
+    assert _fix_date("2023-08-26 19:07", "판매일:26082019:07,목요일") == ("2026-08-20 19:07", ["date_from_ocr"])
+    # `일자`·`일시` 가 붙은 라벨 (VLM 은 연도만 틀렸다. 월·일이 한 글자 다르면 요일 없이는 바꾸지 않는 규칙이 따로 있다)
+    assert _fix_date("2023-08-20", "거래일자 20260820") == ("2026-08-20", ["date_from_ocr"])
+    assert _fix_date("2023-08-20 19:07", "승인일시 260820 19:07") == ("2026-08-20 19:07", ["date_from_ocr"])
+
+
+def test_date_glued_digits_without_a_label_are_not_dates():
+    # 거래번호·승인번호·바코드는 날짜 라벨이 없으므로 날짜로 읽지 않는다
+    texts = ["거래N0:0820802698 계산원:최타숙(005)", "260820", "승인번호 26082011", "8801234260820"]
+    assert _fix_date("2026-08-26 19:07", *texts) == ("2026-08-26 19:07", [])
+    # 라벨 뒤라도 날짜가 될 수 없는 숫자는 버린다
+    assert _fix_date("2026-08-26 19:07", "판매일:261340") == ("2026-08-26 19:07", [])
+
+
+def test_date_stale_year_moves_to_the_latest_past_year_when_no_date_was_read():
+    """홈푸드마트 실측 8장: OCR 이 날짜 줄을 못 읽었고 VLM 은 월·일·시각은 맞게, 연도만 2023 으로 읽었다."""
+    texts = ["홈푸드마트(선우유통)", "248-88-01934 박혜선 053-286-4777", "다구달성군 구지면 창리로115"]
+    assert _fix_date("2023-08-25 18:43", *texts) == ("2026-08-25 18:43", ["stale_year"])
+    # 올해 그 월·일이 아직 안 왔으면 작년으로 옮긴다 (_TODAY = 2026-10-01)
+    assert _fix_date("2023-12-24", *texts) == ("2025-12-24", ["stale_year"])
+    # 내일 날짜까지는 올해로 본다(서버와 사용자 시간대 차이)
+    assert _fix_date("2022-10-02 09:00", *texts) == ("2026-10-02 09:00", ["stale_year"])
+
+
+def test_date_stale_year_leaves_this_and_last_year_alone():
+    assert _fix_date("2026-08-25 18:43") == ("2026-08-25 18:43", [])
+    assert _fix_date("2025-03-01") == ("2025-03-01", [])
+    # 올해·작년 모두 없는 2월 29일은 옮길 곳이 없어 둔다
+    assert _fix_date("2020-02-29") == ("2020-02-29", [])
+
+
+def test_date_stale_year_does_not_touch_an_old_date_printed_on_the_receipt():
+    # 오래된 영수증이고 그 날짜가 (신뢰도가 낮아도) 영수증에 찍혀 있으면 VLM 날짜가 맞다
+    assert _fix_date("2023-08-25 18:43", "판매일:23-08-25 18:43", conf=0.5) == ("2023-08-25 18:43", [])
+
+
+def test_date_stale_year_is_not_used_when_the_old_year_is_printed_somewhere():
+    """VLM 의 오래된 연도가 날짜 모양으로 찍혀 있으면 정말 오래된 영수증일 수 있다. 그 줄을 날짜로 못 써도 둔다."""
+    # OCR 이 5 를 6 으로 읽어 요일이 안 맞아 버린 줄
+    assert _fix_date("2023-08-25 18:43", "판매일:23-08-26 18:43 금요일") == ("2023-08-25 18:43", [])
+    # 신뢰도가 낮아 날짜 후보에서 빠진 줄
+    assert _fix_date("2023-08-25 18:43", "판매일:23-08-26 18:43", conf=0.6) == ("2023-08-25 18:43", [])
+    # 날짜 후보로 읽지 않는 한글 표기
+    assert _fix_date("2023-08-25", "2023년 08월 26일") == ("2023-08-25", [])
+    # 최근 연도인데 월·일이 VLM 과 다른 날짜가 찍혀 있으면 VLM 월·일부터 의심스러워 연도만 옮기지 않는다
+    assert _fix_date("2023-08-25 18:43", "판매일: 2026년 08월 20일 18:43") == ("2023-08-25 18:43", [])
+    assert _fix_date("2023-08-25 18:43", "판매일:26-08-20 18:43", conf=0.6) == ("2023-08-25 18:43", [])
+    assert _fix_date("2023-08-18", "판매일:26-08-19 목요일") == ("2023-08-18", [])
+    # VLM 과 다른 연도로 보이는 잡음(흐린 줄의 `21-10-7`)은 막지 않는다
+    assert _fix_date("2023-08-25 18:43", "1자1.1.84 281.21-10-7", "248-88-01934", conf=0.6) == (
+        "2026-08-25 18:43", ["stale_year"])

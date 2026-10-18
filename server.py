@@ -753,6 +753,17 @@ _DATE_LABEL = re.compile(r"판\s*매\s*[일입]|거\s*래\s*[일입]|[일입]\s*
                          r"승\s*인\s*[일입]|날\s*짜|발\s*행\s*[일입]|구\s*매\s*[일입]|DATE|Date")
 
 
+# 라벨 바로 뒤에 구분자 없이 붙여 찍은 날짜: `판매일:260820 19:07`, `거래일자 20260820`, `판매일:26082019:07`.
+# 구분자가 없는 숫자는 거래번호·승인번호와 구별이 안 되므로 날짜 라벨이 바로 앞에 있을 때만 날짜로 본다.
+# 라벨 단독 `일시` 는 `일시불` 과 헷갈리고, `날짜`·`DATE` 뒤에 붙은 숫자는 실측 사례가 없어 넣지 않는다.
+_LABELED_COMPACT_DATE = re.compile(
+    r"(?:판\s*매|거\s*래|결\s*제|주\s*문|승\s*인|발\s*행|구\s*매)\s*[일입](?:\s*[자시])?\s*[:：]?\s*"
+    r"(20\d{2}|\d{2})(\d{2})(\d{2})(?:(?!\d)|(?=\d{1,2}\s*:\s*\d{2}))(?:\s*(\d{1,2})\s*:\s*(\d{2})(?!\d))?"
+)
+# `2023년 8월 25일`. 날짜 후보로 쓰지는 않고, 연도 보정을 막을 근거가 있는지 볼 때만 쓴다.
+_KOREAN_YMD = re.compile(r"(?<!\d)(\d{4}|\d{2})\s*년\s*(\d{1,2})\s*월\s*(\d{1,2})\s*일")
+
+
 # 날짜 줄에 같이 찍힌 요일: `수요일`, `[일]`, `(수)`
 _PRINTED_WEEKDAY = re.compile(r"([월화수목금토일])\s*요\s*일|[\[(]\s*([월화수목금토일])\s*[\])]")
 _WEEKDAYS = "월화수목금토일"  # date.weekday() 순서(월=0)
@@ -774,11 +785,14 @@ def _printed_dates(ocr_lines: list[dict], today: _date | None = None) -> list[tu
         if float(line.get("confidence") or 0) < 0.75:
             continue
         text = line.get("text") or ""
+        candidates = []
         for m in _PRINTED_DATE.finditer(text):
             if m.group(1):
-                yy, mo, dd, hh, mi = m.group(1), m.group(2), m.group(3), m.group(4), m.group(5)
+                candidates.append((m.group(1), m.group(2), m.group(3), m.group(4), m.group(5)))
             else:
-                yy, mo, dd, hh, mi = m.group(6), m.group(7), m.group(8), None, None
+                candidates.append((m.group(6), m.group(7), m.group(8), None, None))
+        candidates += [m.groups() for m in _LABELED_COMPACT_DATE.finditer(text)]
+        for yy, mo, dd, hh, mi in candidates:
             year = int(yy) if len(yy) == 4 else 2000 + int(yy)
             try:
                 day = _date(year, int(mo), int(dd))
@@ -847,6 +861,8 @@ def _fix_date_from_ocr(parsed: dict, ocr_lines: list[dict], corrections: list, t
         return
     printed = _printed_dates(ocr_lines, today)
     if not printed:
+        if not _date_evidence_against_stale_year(value, ocr_lines, today):
+            _fix_stale_year(parsed, value, corrections, today)
         return
     labeled = [p for p in printed if p[2]]
     pool = labeled or printed
@@ -880,6 +896,56 @@ def _fix_date_from_ocr(parsed: dict, ocr_lines: list[dict], corrections: list, t
     fixed = f"{day} {clock}" if clock else day
     parsed["purchased_at"] = fixed
     corrections.append({"field": "purchased_at", "before": value, "after": fixed, "reason": "date_from_ocr"})
+
+
+def _date_evidence_against_stale_year(value: str, ocr_lines: list[dict], today: _date) -> bool:
+    """날짜 후보로는 못 썼지만(신뢰도가 낮은 줄, 요일이 안 맞아 버린 줄, `2026년 8월 20일` 같은 표기) 영수증에 찍힌
+    날짜 모양 글자가 연도 보정에 반대하는가.
+
+    - VLM 연도가 그대로 찍혀 있다: 정말 오래된 영수증일 수 있다.
+    - 올해·작년 연도인데 월·일이 VLM 과 다르다: VLM 월·일부터 틀렸을 수 있어, 연도만 옮기면 그럴듯하게 틀린
+      날짜가 된다. 차라리 눈에 띄게 오래된 VLM 날짜를 둔다.
+    """
+    year, md = value[:4], (int(value[5:7]), int(value[8:10]))
+    recent = {str(today.year), str(today.year - 1), str(today.year)[2:], str(today.year - 1)[2:]}
+    for line in ocr_lines:
+        text = line.get("text") or ""
+        found = [(m.group(1), m.group(2), m.group(3)) if m.group(1) else (m.group(6), m.group(7), m.group(8))
+                 for m in _PRINTED_DATE.finditer(text)]
+        found += [m.groups()[:3] for m in _LABELED_COMPACT_DATE.finditer(text)]
+        found += [m.groups() for m in _KOREAN_YMD.finditer(text)]
+        for yy, mo, dd in found:
+            if yy in (year, year[2:]):
+                return True
+            if yy in recent and (int(mo), int(dd)) != md:
+                return True
+    return False
+
+
+def _fix_stale_year(parsed: dict, value: str, corrections: list, today: _date) -> None:
+    """OCR 이 쓸 수 있는 날짜를 하나도 못 읽었고 VLM 연도가 재작년 이전이면 연도만 최근으로 바꾼다.
+
+    실측(홈푸드마트 등 흐린 영수증 8장): 연도 두 자리(`26-08-25`)를 VLM 이 월·일·시각은 맞게 읽고 연도만
+    `2023` 으로 지어냈다. 정산은 최근 영수증으로 하므로, 그 월·일이 오늘을 넘지 않는 가장 최근 해(올해 또는
+    작년)로 옮긴다. 월·일·시각은 VLM 값 그대로 둔다.
+
+    작년 영수증은 그대로 둔다(연말 영수증을 새해에 올리는 일이 흔하다). 날짜 후보로 못 쓴 글자라도 보정에
+    반대하는 근거가 있으면 부르지 않는다(`_date_evidence_against_stale_year`). 재작년 이전 영수증을 올렸는데
+    OCR 이 그 날짜를 전혀 못 읽은 경우에는 연도가 틀어진다. 이때도 월·일은 그대로라 사용자가 연도만 고치면 된다.
+    """
+    month, day = int(value[5:7]), int(value[8:10])
+    if int(value[:4]) >= today.year - 1:
+        return
+    for year in (today.year, today.year - 1):
+        try:
+            candidate = _date(year, month, day)
+        except ValueError:  # 2월 29일
+            continue
+        if candidate <= today + timedelta(days=1):
+            fixed = candidate.isoformat() + value[10:]
+            parsed["purchased_at"] = fixed
+            corrections.append({"field": "purchased_at", "before": value, "after": fixed, "reason": "stale_year"})
+            return
 
 
 def _merge_wrapped_names(kept: list[dict], corrections: list):
