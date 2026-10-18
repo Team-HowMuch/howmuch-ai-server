@@ -56,6 +56,16 @@ def test_both_prompts_ask_for_the_same_keys_we_merge():
     assert "YYYY-MM-DD" in server._PLACEHOLDERS["purchased_at"]
 
 
+def test_prompt_v3_is_v1_plus_the_name_rule_only():
+    """v3 는 v1 과 비교해 품목명 규칙의 효과만 재려는 것이다. 다른 규칙이 섞이면 안 된다."""
+    import server
+
+    assert server._resolve_pipeline("v3", None)[0] == "v3"
+    assert server.PROMPT_V3.replace(server._NAME_RULE, "") == server.PROMPT_V1
+    assert "160g" in server.PROMPT_V3 and "빼거나 줄이지 마" in server._NAME_RULE
+    assert '"delivery_fee"' not in server.PROMPT_V3
+
+
 # ---------------------------------------------------------------- v2 배달비 필드
 
 def _baemin_lines(fee_rows=()):

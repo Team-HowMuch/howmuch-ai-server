@@ -169,3 +169,32 @@ def test_default_path_uses_one_image_for_both_inputs():
     assert cropped.ocr_image is cropped.vlm_image
     hires = pre.prepare(_photo(), ("hires",))
     assert hires.ocr_image is not hires.vlm_image
+
+
+def test_vlmhires_enlarges_only_the_vlm_input_within_the_pixel_cap():
+    """vlmhires 는 VLM 입력만 키운다. OCR 입력은 기본 크기(1536)로 두어 VLM 해상도 효과만 잰다."""
+    assert pre.parse_steps("vlmhires,crop") == ("crop", "vlmhires")
+    prepared = pre.prepare(_photo(), ("vlmhires",))
+    width, height = prepared.vlm_image.size
+    # 3000x4000 은 긴 변 2560 이면 1920x2560(4.9M 픽셀)이라 픽셀 상한(3.6M)으로 더 줄어든다
+    assert width * height <= pre.VLM_HIRES_MAX_PIXELS
+    assert max(width, height) > 1536
+    assert abs(width / height - 3000 / 4000) < 0.01
+    assert prepared.ocr_image.size == (1152, 1536)
+    assert prepared.info["vlm_size"] == [width, height]
+
+
+def test_vlmhires_on_a_tall_narrow_receipt_uses_the_full_long_side():
+    prepared = pre.prepare(_photo(size=(1000, 4000), receipt=(100, 100, 900, 3900)), ("vlmhires",))
+    assert prepared.vlm_image.size == (640, 2560)
+
+
+def test_vlmhires_never_upscales_a_small_photo():
+    prepared = pre.prepare(_photo(size=(900, 1200), receipt=(100, 100, 800, 1100)), ("vlmhires",))
+    assert prepared.vlm_image.size == (900, 1200)
+
+
+def test_vlmhires_with_hires_gives_ocr_its_own_hires_input():
+    prepared = pre.prepare(_photo(), ("hires", "vlmhires"))
+    assert prepared.ocr_image.size == (1920, 2560)
+    assert prepared.vlm_image.size[0] * prepared.vlm_image.size[1] <= pre.VLM_HIRES_MAX_PIXELS

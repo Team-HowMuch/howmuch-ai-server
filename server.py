@@ -71,7 +71,18 @@ PROMPT_V2 = """이 한국 영수증 이미지를 읽고 아래 JSON 형식으로
 - 금액은 숫자만(콤마 없이) 적어.
 - 읽을 수 없는 값은 null로 해."""
 
-PROMPTS = {"v1": PROMPT_V1, "v2": PROMPT_V2}
+# v3: v1 에 품목명 규칙만 더한다(v1 과 비교해 이 규칙의 효과만 잰다).
+# 실측 63장에서 틀린 품목명 103개 중 35개가 용량·규격을 빼먹은 것(`오리온)고래밥 160g` → `오리온) 고래밥`),
+# 39개가 한두 글자 오독이었다. 이 규칙은 빼먹기만 겨눈다. "보이는 대로, 고치지 마" 같은 말은 넣지 않는다.
+# 흐린 글자를 VLM 이 아는 상품명 쪽으로 읽는 것이 오히려 오독을 줄이는 경우가 많다(초발→초벌).
+_NAME_RULE = """
+- 품목명(name)은 영수증에 인쇄된 상품명 전체를 옮겨. 브랜드 접두어(예: 오리온)), 용량·규격(예: 160g, 250ml, 1L, 3개입), 괄호와 그 안의 글자를 빼거나 줄이지 마. 품목 앞의 순번(001, 002)과 바코드 숫자는 빼."""
+PROMPT_V3 = PROMPT_V1.replace(
+    "\n- 한국 영수증 날짜는 보통", _NAME_RULE + "\n- 한국 영수증 날짜는 보통", 1
+)
+assert PROMPT_V3 != PROMPT_V1
+
+PROMPTS = {"v1": PROMPT_V1, "v2": PROMPT_V2, "v3": PROMPT_V3}
 # 요청이 고르지 않을 때 쓰는 기본값. 실측 비교가 끝날 때까지 기존 동작(v1, 전처리 없음)을 유지한다.
 DEFAULT_PROMPT = os.environ.get("VLM_PROMPT_VERSION", "v1").strip().lower()
 DEFAULT_PREPROCESS = os.environ.get("OCR_PREPROCESS", "")
@@ -1429,12 +1440,12 @@ async def ocr_receipt(
     file: UploadFile = File(..., description="영수증 이미지 파일"),
     prompt: str | None = Query(
         None,
-        description="실험용. VLM 프롬프트 버전(v1·v2). 비우면 서버 기본값(환경변수 VLM_PROMPT_VERSION)",
+        description="실험용. VLM 프롬프트 버전(v1·v2·v3). 비우면 서버 기본값(환경변수 VLM_PROMPT_VERSION)",
     ),
     preprocess: str | None = Query(
         None,
         description=(
-            "실험용. 쉼표로 고르는 전처리 단계(crop·hires·clahe). 빈 문자열이면 끔. "
+            "실험용. 쉼표로 고르는 전처리 단계(crop·hires·vlmhires·clahe). 빈 문자열이면 끔. "
             "생략하면 서버 기본값(환경변수 OCR_PREPROCESS)"
         ),
     ),

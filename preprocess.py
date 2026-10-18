@@ -29,7 +29,14 @@ BASE_MAX_SIDE = 1536
 #: hires 를 켰을 때 OCR 입력의 긴 변 상한.
 HIRES_MAX_SIDE = 2560
 
-STEPS = ("crop", "hires", "clahe")
+#: vlmhires 를 켰을 때 VLM 입력의 긴 변 상한과 픽셀 수 상한.
+#: 실측: 1536px 에서 VLM 이 흐린 품목명의 글자를 틀리게 읽고(초벌→초발) 용량(160g)을 빠뜨렸다.
+#: 픽셀 상한은 vLLM --max-model-len 8192 를 넘지 않게 둔다. Qwen2.5-VL 은 28x28 픽셀이 토큰 하나라
+#: 3.6M 픽셀은 이미지 토큰 약 4,600 개이고, 프롬프트와 출력(최대 2048)을 더해도 8192 안이다.
+VLM_HIRES_MAX_SIDE = 2560
+VLM_HIRES_MAX_PIXELS = 3_600_000
+
+STEPS = ("crop", "hires", "vlmhires", "clahe")
 
 # crop 판정 기준. 후보가 화면의 이보다 작으면 영수증이 아니라 작은 물체를 잡았다고 본다.
 # 낮게 둔다: 멀리서 찍어 영수증이 작게 나온 사진이 잘라내기가 가장 필요한 경우다.
@@ -76,11 +83,18 @@ class Prepared:
     info: dict = field(default_factory=dict)
 
 
-def _limit(image: Image.Image, max_side: int) -> Image.Image:
-    if max(image.size) <= max_side:
+def _limit(image: Image.Image, max_side: int, max_pixels: int | None = None) -> Image.Image:
+    """긴 변을 max_side 이하로, max_pixels 를 주면 넓이도 그 이하로 줄인다(키우지는 않는다).
+    기존 입력과 같은 결과가 나오게 축소는 지금까지처럼 thumbnail 로 한다."""
+    width, height = image.size
+    box = (max_side, max_side)
+    if max_pixels and width * height > max_pixels:
+        scale = (max_pixels / (width * height)) ** 0.5
+        box = (min(max_side, int(width * scale)), min(max_side, int(height * scale)))
+    if width <= box[0] and height <= box[1]:
         return image.copy()
     out = image.copy()
-    out.thumbnail((max_side, max_side))
+    out.thumbnail(box)
     return out
 
 
@@ -169,10 +183,19 @@ def prepare(image: Image.Image, steps: tuple[str, ...]) -> Prepared:
         if box:
             source = image.crop(box)
 
-    vlm_image = _limit(source, BASE_MAX_SIDE)
-    # hires 가 꺼져 있으면 OCR 입력은 VLM 입력과 같은 이미지다. 같은 객체를 돌려줘 호출부가
+    if "vlmhires" in steps:
+        vlm_image = _limit(source, VLM_HIRES_MAX_SIDE, VLM_HIRES_MAX_PIXELS)
+    else:
+        vlm_image = _limit(source, BASE_MAX_SIDE)
+    # hires 가 꺼져 있으면 OCR 입력은 기본 크기다. vlmhires 만 켰을 때도 OCR 은 그대로 두어
+    # VLM 해상도의 효과만 따로 잴 수 있게 한다. 둘 다 기본이면 같은 객체를 돌려줘 호출부가
     # 한 번만 저장하게 한다.
-    ocr_image = _limit(source, HIRES_MAX_SIDE) if "hires" in steps else vlm_image
+    if "hires" in steps:
+        ocr_image = _limit(source, HIRES_MAX_SIDE)
+    elif "vlmhires" in steps:
+        ocr_image = _limit(source, BASE_MAX_SIDE)
+    else:
+        ocr_image = vlm_image
 
     if "clahe" in steps:
         try:
