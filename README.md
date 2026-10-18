@@ -169,8 +169,8 @@ VLM 이 옵션을 놓치거나 품목으로 올려도 OCR 줄의 기호·위치�
 
 | 쿼리 | 값 | 기본값(환경변수) |
 |---|---|---|
-| `prompt` | `v1`(기존) · `v2`(배달비 칸, `ㄴ` 옵션 기호, 시각 없으면 날짜만, 상호명 규칙) | `VLM_PROMPT_VERSION`, 없으면 `v1` |
-| `preprocess` | 쉼표로 `crop`(영수증 영역 잘라내기) · `hires`(OCR 입력만 긴 변 2560) · `clahe`(OCR 입력만 대비 보정). 빈 문자열이면 끔 | `OCR_PREPROCESS`, 없으면 끔 |
+| `prompt` | `v1`(기존) · `v2`(배달비 칸, `ㄴ` 옵션 기호, 시각 없으면 날짜만, 상호명 규칙) · `v3`(v1 + 품목명을 브랜드·용량까지 빼지 말고 옮기라는 규칙만) | `VLM_PROMPT_VERSION`, 없으면 `v1` |
+| `preprocess` | 쉼표로 `crop`(영수증 영역 잘라내기) · `hires`(OCR 입력만 긴 변 2560) · `vlmhires`(VLM 입력만 긴 변 2560, 360만 픽셀 이하) · `clahe`(OCR 입력만 대비 보정). 빈 문자열이면 끔 | `OCR_PREPROCESS`, 없으면 끔 |
 
 예: `POST /ocr/receipt?prompt=v2&preprocess=crop,hires`
 
